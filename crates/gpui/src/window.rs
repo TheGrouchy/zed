@@ -6,8 +6,8 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, ImageSampling, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LinearGradientMask,
+    Hsla, ImageFilter, ImageSampling, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent,
+    KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LinearGradientMask,
     LinearGradientMaskGroupError, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
     MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
@@ -4541,6 +4541,8 @@ impl Window {
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
                 sampling: ImageSampling::Linear,
+                filter: ImageFilter::None,
+                filter_alignment_pad: 0,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -4650,7 +4652,30 @@ impl Window {
         grayscale: bool,
         sampling: ImageSampling,
     ) -> Result<()> {
-        self.paint_image_fitted_with_sampling(
+        self.paint_image_with_sampling_and_filter(
+            bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            sampling,
+            ImageFilter::None,
+        )
+    }
+
+    /// Paint an image with explicit texture sampling and post-sampling filter
+    /// modes.
+    pub fn paint_image_with_sampling_and_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        sampling: ImageSampling,
+        filter: ImageFilter,
+    ) -> Result<()> {
+        self.paint_image_fitted_with_sampling_and_filter(
             bounds,
             bounds,
             corner_radii,
@@ -4658,6 +4683,7 @@ impl Window {
             frame_index,
             grayscale,
             sampling,
+            filter,
         )
     }
 
@@ -4708,10 +4734,45 @@ impl Window {
         grayscale: bool,
         sampling: ImageSampling,
     ) -> Result<()> {
+        self.paint_image_fitted_with_sampling_and_filter(
+            visible,
+            fitted,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            sampling,
+            ImageFilter::None,
+        )
+    }
+
+    fn validate_image_filter(filter: ImageFilter, grayscale: bool) -> Result<()> {
+        if filter == ImageFilter::Invert && grayscale {
+            return Err(anyhow!(
+                "combining CSS invert(1) with grayscale is not certified"
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::paint_image_fitted_with_sampling`] with an explicit finite
+    /// post-sampling image filter.
+    pub fn paint_image_fitted_with_sampling_and_filter(
+        &mut self,
+        visible: Bounds<Pixels>,
+        fitted: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        sampling: ImageSampling,
+        filter: ImageFilter,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let crop = (visible != fitted).then_some((visible, fitted));
         Self::validate_image_sampling(sampling, crop.is_some())?;
+        Self::validate_image_filter(filter, grayscale)?;
         let bounds = self.snap_bounds(visible);
         let params = RenderImageParams {
             image_id: data.id,
@@ -4762,6 +4823,8 @@ impl Window {
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             sampling,
+            filter,
+            filter_alignment_pad: 0,
             grayscale: grayscale.into(),
             bounds,
             content_mask,
@@ -7026,8 +7089,9 @@ pub fn outline(
 mod tests {
     use crate::{
         AppContext as _, AtlasKey, AtlasTextureKind, Bounds, Context, FocusHandle, FontId, GlyphId,
-        ImageSampling, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-        RenderGlyphParams, Styled as _, TestAppContext, Window, canvas, div, point, px, size,
+        ImageFilter, ImageSampling, InteractiveElement as _, IntoElement, ParentElement as _,
+        Pixels, Render, RenderGlyphParams, Styled as _, TestAppContext, Window, canvas, div, point,
+        px, size,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -7131,6 +7195,13 @@ mod tests {
         assert!(Window::validate_image_sampling(ImageSampling::Linear, true).is_ok());
         assert!(Window::validate_image_sampling(ImageSampling::Pixelated, false).is_ok());
         assert!(Window::validate_image_sampling(ImageSampling::Pixelated, true).is_err());
+    }
+
+    #[test]
+    fn image_filter_rejects_uncertified_filter_chains() {
+        assert!(Window::validate_image_filter(ImageFilter::None, false).is_ok());
+        assert!(Window::validate_image_filter(ImageFilter::Invert, false).is_ok());
+        assert!(Window::validate_image_filter(ImageFilter::Invert, true).is_err());
     }
 
     struct FocusForwarder {

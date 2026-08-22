@@ -1642,6 +1642,8 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 struct PolychromeSprite {
     order: u32,
     sampling: u32,
+    image_filter: u32,
+    filter_alignment_pad: u32,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
@@ -1684,6 +1686,18 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
+    if (sprite.image_filter == 1u) {
+        if (color.a == 0.0) {
+            color = vec4<f32>(vec3<f32>(0.0), color.a);
+        } else {
+            let premultiplied_rgb = min(
+                floor(color.rgb * color.a * 255.0 + vec3<f32>(0.5)) / 255.0,
+                vec3<f32>(color.a),
+            );
+            let inverted_premultiplied_rgb = vec3<f32>(color.a) - premultiplied_rgb;
+            color = vec4<f32>(inverted_premultiplied_rgb / color.a, color.a);
+        }
+    }
     if (sprite.grayscale != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);

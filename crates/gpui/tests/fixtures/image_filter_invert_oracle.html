@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body {
+    width: 35px;
+    height: 16px;
+    margin: 0;
+    overflow: hidden;
+    background: transparent;
+  }
+  img, canvas { position: absolute; top: 0; }
+  #source { left: 0; width: 16px; height: 16px; }
+  #inverted { left: 16px; width: 16px; height: 16px; filter: invert(1); }
+  #edges { left: 32px; width: 3px; height: 1px; filter: invert(1); }
+</style>
+<img id="source" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAACLElEQVRoge3ZO3NNURgG4MdEyNAoVGISapfCpaX0CyhpNS6d/AFDxVDQ0voFdNRoSB0n49Io0jBMZBzFPodz2Huvtde+zchZM5lTPTPve3a+PetLmJ3ZqXXmavqdo89hT34+0YHjuIkDPfljeJgC9+EaBljHcoK/2oBfU/HJzeEsnuHHCA8qBBj7pw366AIHcRufJ2CVAG35YIEFXMBr/MzBoQBt+9ICR/EYXwtgKEAXPrfA30NS9pMXoEs/VaBoSGID9OF/FygbklCAJdm7vA8/hEt4qXhIQgGu9+g34XsCHOINbuBdj/6yBLiBe7Lf3eXRt5jql2r4w0YnFm7hOc75cwmrUqANH13gvexx7zd9YgO05YMFvuEJTmBHjg0FaNuXFniLi9hTBAMBVjvwuQX+GZKKAbr0UwUKhyQyQJO+0qYVHJJAgHV8bMCvJHjwCKeUDEkgwN0e/TzsToBkO+ktHOrRP0iBkzvtQNpOe6UBn7QTn5FddzdHuEqANnx0gUXZ407dadvywQILOI9X0nfaNn1pgSOyN9SXAhgK0IXPLfBf7MSbkXgyQBM+b0ijCpQNSSjAeKftww/JbnzbdideUW+nreu37048vu5WKbCFFw376AIf5F93YwO05YMFxjvpSfV22rZ8aYFV2V/t9hbBQIAufG6BDdxXb6ftyk8VKBySyAB9eEQMSSDAOj715JH9FyR1J13EHZzuySN9Jya7gO3q0c/O7NQ9vwA2ZL59TXd5CAAAAABJRU5ErkJggg==">
+<img id="inverted">
+<canvas id="edges" width="3" height="1"></canvas>
+<script>
+  document.getElementById("inverted").src = document.getElementById("source").src;
+  const ctx = document.getElementById("edges").getContext("2d");
+  const pixels = ctx.createImageData(3, 1);
+  pixels.data.set([
+    17, 33, 49, 0,
+    64, 128, 192, 128,
+    10, 20, 30, 255,
+  ]);
+  ctx.putImageData(pixels, 0, 0);
+</script>

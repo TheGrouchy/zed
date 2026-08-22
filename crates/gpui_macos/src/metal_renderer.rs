@@ -8,9 +8,9 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, DrawOrder,
-    ImageSampling, LinearGradientMaskParams, MonochromeSprite, PaintSurface, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, ScaledTextShadow, Scene, Shadow, Size,
-    Surface, TextShadowGroup, Underline, point, size,
+    ImageFilter, ImageSampling, LinearGradientMaskParams, MonochromeSprite, PaintSurface, Path,
+    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, ScaledTextShadow, Scene, Shadow,
+    Size, Surface, TextShadowGroup, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -1233,10 +1233,12 @@ impl MetalRenderer {
                 PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     sampling,
+                    filter,
                     range,
                 } => self.draw_polychrome_sprites(
                     texture_id,
                     sampling,
+                    filter,
                     &scene.polychrome_sprites[range],
                     instance_buffer,
                     &mut instance_offset,
@@ -1539,10 +1541,12 @@ impl MetalRenderer {
                 PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     sampling,
+                    filter,
                     range,
                 } => self.draw_polychrome_sprites(
                     texture_id,
                     sampling,
+                    filter,
                     &scene.polychrome_sprites[range],
                     instance_buffer,
                     instance_offset,
@@ -2268,6 +2272,7 @@ impl MetalRenderer {
         &self,
         texture_id: AtlasTextureId,
         sampling: ImageSampling,
+        filter: ImageFilter,
         sprites: &[PolychromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
@@ -2277,6 +2282,7 @@ impl MetalRenderer {
         if sprites.is_empty() {
             return true;
         }
+        debug_assert!(sprites.iter().all(|sprite| sprite.filter == filter));
         align_offset(instance_offset);
 
         let texture = self.sprite_atlas.metal_texture(texture_id);

@@ -39,6 +39,23 @@ pub enum ImageSampling {
     Pixelated = 1,
 }
 
+/// A finite color filter applied to one polychrome image after texture
+/// sampling.
+///
+/// This deliberately exposes only the locked CSS `invert(1)` behavior. Other
+/// CSS filter functions, partial invert amounts, and filter chains must fail
+/// before producing this renderer primitive.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[repr(u32)]
+pub enum ImageFilter {
+    /// Preserve the sampled image colors.
+    #[default]
+    None = 0,
+    /// CSS `filter: invert(1)`, evaluated in premultiplied-alpha space while
+    /// preserving the sampled alpha channel.
+    Invert = 1,
+}
+
 /// A cardinal direction for a CSS-compatible linear alpha mask.
 ///
 /// The locked Waypath masks use only `to top`, `to right`, and `to bottom`.
@@ -1469,6 +1486,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::PolychromeSprite => {
                 let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
                 let sampling = self.polychrome_sprites_iter.peek().unwrap().sampling;
+                let filter = self.polychrome_sprites_iter.peek().unwrap().filter;
                 let sprites_start = self.polychrome_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.polychrome_sprites_iter.next();
@@ -1478,6 +1496,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                         (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
                             && sprite.sampling == sampling
+                            && sprite.filter == filter
                     })
                     .is_some()
                 {
@@ -1487,6 +1506,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 Some(PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     sampling,
+                    filter,
                     range: sprites_start..sprites_end,
                 })
             }
@@ -1541,6 +1561,7 @@ pub enum PrimitiveBatch {
     PolychromeSprites {
         texture_id: AtlasTextureId,
         sampling: ImageSampling,
+        filter: ImageFilter,
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
@@ -1573,10 +1594,11 @@ impl PrimitiveBatch {
             Self::PolychromeSprites {
                 texture_id,
                 sampling,
+                filter,
                 range,
             } => {
                 format!(
-                    "polychrome sprites ({}) on atlas {} with {sampling:?} sampling",
+                    "polychrome sprites ({}) on atlas {} with {sampling:?} sampling and {filter:?} filter",
                     range.len(),
                     texture_id.index
                 )
@@ -1844,6 +1866,8 @@ impl From<SubpixelSprite> for Primitive {
 pub struct PolychromeSprite {
     pub order: DrawOrder,
     pub sampling: ImageSampling,
+    pub filter: ImageFilter,
+    pub filter_alignment_pad: u32,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
@@ -2888,7 +2912,7 @@ mod image_sampling_tests {
     use crate::{AtlasTextureId, AtlasTextureKind, DevicePixels, TileId, size};
     use serde_json::Value;
 
-    fn sprite(x: f32, sampling: ImageSampling) -> PolychromeSprite {
+    fn sprite(x: f32, sampling: ImageSampling, filter: ImageFilter) -> PolychromeSprite {
         let bounds = Bounds {
             origin: point(ScaledPixels(x), ScaledPixels(0.0)),
             size: size(ScaledPixels(8.0), ScaledPixels(8.0)),
@@ -2896,6 +2920,8 @@ mod image_sampling_tests {
         PolychromeSprite {
             order: 0,
             sampling,
+            filter,
+            filter_alignment_pad: 0,
             grayscale: false.into(),
             opacity: 1.0,
             bounds,
@@ -2920,12 +2946,26 @@ mod image_sampling_tests {
     #[test]
     fn sampling_is_part_of_batches_and_paint_cache_replay() {
         assert_eq!(ImageSampling::default(), ImageSampling::Linear);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 128);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 136);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, order), 0);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, sampling), 4);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, filter), 8);
+        assert_eq!(
+            std::mem::offset_of!(PolychromeSprite, filter_alignment_pad),
+            12
+        );
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, grayscale), 16);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, opacity), 20);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, bounds), 24);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, content_mask), 40);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, corner_radii), 56);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, fade), 72);
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, tile), 104);
 
         let mut previous = Scene::default();
-        previous.insert_primitive(sprite(0.0, ImageSampling::Linear));
-        previous.insert_primitive(sprite(10.0, ImageSampling::Pixelated));
-        previous.insert_primitive(sprite(20.0, ImageSampling::Linear));
+        previous.insert_primitive(sprite(0.0, ImageSampling::Linear, ImageFilter::None));
+        previous.insert_primitive(sprite(10.0, ImageSampling::Pixelated, ImageFilter::None));
+        previous.insert_primitive(sprite(20.0, ImageSampling::Linear, ImageFilter::None));
         previous.finish();
 
         let modes = previous
@@ -2965,6 +3005,144 @@ mod image_sampling_tests {
                 .iter()
                 .all(|sprite| sprite.tile.tile_id == TileId(7))
         );
+    }
+
+    #[test]
+    fn image_filter_is_part_of_batches_and_paint_cache_replay() {
+        assert_eq!(ImageFilter::default(), ImageFilter::None);
+
+        let mut previous = Scene::default();
+        previous.insert_primitive(sprite(0.0, ImageSampling::Linear, ImageFilter::None));
+        previous.insert_primitive(sprite(10.0, ImageSampling::Linear, ImageFilter::Invert));
+        previous.insert_primitive(sprite(20.0, ImageSampling::Linear, ImageFilter::None));
+        previous.finish();
+
+        let filters = previous
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::PolychromeSprites { filter, .. } => Some(filter),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            filters,
+            [ImageFilter::None, ImageFilter::Invert, ImageFilter::None]
+        );
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..previous.len(), &previous);
+        replayed.finish();
+        assert_eq!(
+            replayed
+                .polychrome_sprites
+                .iter()
+                .map(|sprite| sprite.filter)
+                .collect::<Vec<_>>(),
+            [ImageFilter::None, ImageFilter::Invert, ImageFilter::None]
+        );
+    }
+
+    fn chromium_premultiplied_invert(pixel: &[u8]) -> [u8; 4] {
+        let alpha = pixel[3] as u32;
+        if alpha == 0 {
+            return [0, 0, 0, 0];
+        }
+        let mut output = [0, 0, 0, pixel[3]];
+        for channel in 0..3 {
+            let premultiplied = (pixel[channel] as u32 * alpha + 127) / 255;
+            let inverted_premultiplied = alpha - premultiplied;
+            output[channel] = ((inverted_premultiplied * 255 + alpha / 2) / alpha) as u8;
+        }
+        output
+    }
+
+    #[test]
+    fn locked_mparticle_invert_matches_every_chromium_pixel() {
+        let metadata: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/image_filter_invert_chromium.json"
+        ))
+        .unwrap();
+        let planes = include_bytes!("../tests/fixtures/image_filter_invert_chromium.rgba");
+        assert_eq!(
+            metadata["sourcePngSha256"],
+            "4936A82C01E3E31DBDCD175323551B3E331838A90719B91A4CDAA931132D579D"
+        );
+        assert_eq!(
+            metadata["sourceAlphaCounts"],
+            serde_json::json!({"transparent": 1068, "partial": 544, "opaque": 692})
+        );
+        assert_eq!(
+            metadata["premultipliedFormula"],
+            "rgb_out = alpha - rgb_in; alpha_out = alpha"
+        );
+
+        let case = |name: &str| {
+            let case = &metadata["cases"][name];
+            let offset = case["rgbaOffset"].as_u64().unwrap() as usize;
+            let length = case["rgbaLength"].as_u64().unwrap() as usize;
+            &planes[offset..offset + length]
+        };
+        let source = case("mparticleNormal");
+        let chromium = case("mparticleInvert");
+        assert_eq!(metadata["lockedRuntimeSize"], serde_json::json!([16, 16]));
+        assert_eq!(source.len(), 16 * 16 * 4);
+        assert_eq!(source.len(), chromium.len());
+        let mismatch = source
+            .chunks_exact(4)
+            .zip(chromium.chunks_exact(4))
+            .position(|(input, output)| chromium_premultiplied_invert(input) != output);
+        assert_eq!(mismatch, None, "locked mParticle invert mismatch");
+        assert!(
+            source
+                .chunks_exact(4)
+                .zip(chromium.chunks_exact(4))
+                .all(|(input, output)| input[3] == output[3])
+        );
+
+        let edge_source = metadata["cases"]["alphaEdgesInvert"]["sourceRgba"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u8)
+            .collect::<Vec<_>>();
+        let edge_chromium = case("alphaEdgesInvert");
+        assert_eq!(edge_source.len(), 12);
+        assert_eq!(
+            edge_source
+                .chunks_exact(4)
+                .map(chromium_premultiplied_invert)
+                .flatten()
+                .collect::<Vec<_>>(),
+            edge_chromium
+        );
+        assert_eq!(
+            edge_chromium,
+            [0, 0, 0, 0, 191, 128, 64, 128, 245, 235, 225, 255]
+        );
+    }
+
+    #[test]
+    fn every_renderer_applies_full_invert_after_sampling_in_premultiplied_space() {
+        let hlsl = include_str!("../../gpui_windows/src/shaders.hlsl");
+        assert!(hlsl.contains("float3 css_invert_full(float3 straight_rgb, float alpha)"));
+        assert!(hlsl.contains("floor(straight_rgb * alpha * 255.0 + 0.5) / 255.0"));
+        assert!(hlsl.contains("alpha.xxx - premultiplied_rgb"));
+        assert!(hlsl.contains("color.rgb = css_invert_full(color.rgb, color.a)"));
+
+        let wgsl = include_str!("../../gpui_wgpu/src/shaders.wgsl");
+        assert!(
+            wgsl.contains(
+                "let inverted_premultiplied_rgb = vec3<f32>(color.a) - premultiplied_rgb"
+            )
+        );
+        assert!(wgsl.contains("floor(color.rgb * color.a * 255.0 + vec3<f32>(0.5)) / 255.0"));
+        assert!(wgsl.contains("vec4<f32>(inverted_premultiplied_rgb / color.a, color.a)"));
+
+        let metal = include_str!("../../gpui_macos/src/shaders.metal");
+        assert!(metal.contains("sprite.filter == ImageFilter_Invert"));
+        assert!(metal.contains("floor(color.rgb * color.a * 255.0 + 0.5) / 255.0"));
+        assert!(metal.contains("color.aaa - premultiplied_rgb"));
+        assert!(metal.contains("color.rgb = inverted_premultiplied_rgb / color.a"));
     }
 
     #[test]

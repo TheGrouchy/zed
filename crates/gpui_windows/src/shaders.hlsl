@@ -1557,13 +1557,28 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 struct PolychromeSprite {
     uint order;
     uint sampling;
+    uint filter;
+    uint filter_alignment_pad;
     uint grayscale;
     float opacity;
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
+    EdgeFadeParams fade;
     AtlasTile tile;
 };
+
+float3 css_invert_full(float3 straight_rgb, float alpha) {
+    if (alpha == 0.0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float3 premultiplied_rgb = min(
+        floor(straight_rgb * alpha * 255.0 + 0.5) / 255.0,
+        alpha.xxx
+    );
+    float3 inverted_premultiplied_rgb = alpha.xxx - premultiplied_rgb;
+    return inverted_premultiplied_rgb / alpha;
+}
 
 struct PolychromeSpriteVertexOutput {
     nointerpolation uint sprite_id: TEXCOORD0;
@@ -1602,6 +1617,9 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
+    if (sprite.filter == 1u) {
+        color.rgb = css_invert_full(color.rgb, color.a);
+    }
     if (sprite.grayscale != 0u) {
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);

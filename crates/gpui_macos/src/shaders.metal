@@ -963,6 +963,17 @@ float4 shade_polychrome_sprite(PolychromeSpriteFragmentInput input,
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
   float4 color = sample;
+  if (sprite.filter == ImageFilter_Invert) {
+    if (color.a == 0.0) {
+      color.rgb = float3(0.0);
+    } else {
+      float3 premultiplied_rgb = min(
+          floor(color.rgb * color.a * 255.0 + 0.5) / 255.0,
+          color.aaa);
+      float3 inverted_premultiplied_rgb = color.aaa - premultiplied_rgb;
+      color.rgb = inverted_premultiplied_rgb / color.a;
+    }
+  }
   if (sprite.grayscale) {
     float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
     color.r = grayscale;

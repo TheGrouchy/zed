@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, ImageSampling, MonochromeSprite,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, TextShadowGroup, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, ImageFilter, ImageSampling,
+    MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    Shadow, Size, SubpixelSprite, TextShadowGroup, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -84,16 +84,25 @@ pub struct WgpuSurfaceConfig {
 #[cfg(test)]
 mod shader_tests {
     #[test]
-    fn linear_mask_wgsl_parses_and_validates() {
+    fn native_wgsl_parses_and_validates() {
         let module = naga::front::wgsl::parse_str(include_str!("shaders.wgsl"))
-            .expect("native mask WGSL must parse");
+            .expect("native WGSL must parse");
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
         );
         validator
             .validate(&module)
-            .expect("native mask WGSL must validate");
+            .expect("native WGSL must validate");
+    }
+
+    #[test]
+    fn image_filter_wgsl_keeps_alpha_and_uses_premultiplied_invert() {
+        let shader = include_str!("shaders.wgsl");
+        assert!(shader.contains("if (sprite.image_filter == 1u)"));
+        assert!(shader.contains("floor(color.rgb * color.a * 255.0 + vec3<f32>(0.5)) / 255.0"));
+        assert!(shader.contains("vec3<f32>(color.a) - premultiplied_rgb"));
+        assert!(shader.contains("vec4<f32>(inverted_premultiplied_rgb / color.a, color.a)"));
     }
 }
 
@@ -1432,11 +1441,13 @@ impl WgpuRenderer {
                         PrimitiveBatch::PolychromeSprites {
                             texture_id,
                             sampling,
+                            filter,
                             range,
                         } => self.draw_polychrome_sprites(
                             &scene.polychrome_sprites[range],
                             texture_id,
                             sampling,
+                            filter,
                             &mut instance_offset,
                             &mut pass,
                         ),
@@ -1593,11 +1604,13 @@ impl WgpuRenderer {
                 PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     sampling,
+                    filter,
                     range,
                 } => self.draw_polychrome_sprites(
                     &scene.polychrome_sprites[range],
                     texture_id,
                     sampling,
+                    filter,
                     instance_offset,
                     &mut pass,
                 ),
@@ -1825,9 +1838,11 @@ impl WgpuRenderer {
         sprites: &[PolychromeSprite],
         texture_id: AtlasTextureId,
         sampling: ImageSampling,
+        filter: ImageFilter,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
+        debug_assert!(sprites.iter().all(|sprite| sprite.filter == filter));
         let tex_info = self.atlas.get_texture_info(texture_id);
         let data = unsafe { Self::instance_bytes(sprites) };
         self.draw_instances_with_texture_and_sampling(

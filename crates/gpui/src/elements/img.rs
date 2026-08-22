@@ -1,9 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageSampling, InspectorElementId,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
-    RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window,
-    decode_static_image, decode_static_image_from_decoder, px,
+    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageFilter, ImageSampling,
+    InspectorElementId, InteractiveElement, Interactivity, IntoElement, LayoutId, Length,
+    ObjectFit, Pixels, RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled,
+    Task, Window, decode_static_image, decode_static_image_from_decoder, px,
 };
 use anyhow::Result;
 
@@ -130,6 +130,7 @@ pub struct ImageStyle {
     grayscale: bool,
     object_fit: ObjectFit,
     sampling: ImageSampling,
+    filter: ImageFilter,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
 }
@@ -140,6 +141,7 @@ impl Default for ImageStyle {
             grayscale: false,
             object_fit: ObjectFit::Contain,
             sampling: ImageSampling::Linear,
+            filter: ImageFilter::None,
             loading: None,
             fallback: None,
         }
@@ -172,6 +174,18 @@ pub trait StyledImage: Sized {
     /// Apply CSS-compatible pixelated sampling to this image.
     fn pixelated(mut self) -> Self {
         self.image_style().sampling = ImageSampling::Pixelated;
+        self
+    }
+
+    /// Select the finite post-sampling color filter for this image.
+    fn image_filter(mut self, filter: ImageFilter) -> Self {
+        self.image_style().filter = filter;
+        self
+    }
+
+    /// Apply exact CSS `filter: invert(1)` semantics to this image.
+    fn invert(mut self) -> Self {
+        self.image_style().filter = ImageFilter::Invert;
         self
     }
 
@@ -512,7 +526,7 @@ impl Element for Img {
                         .to_pixels(window.rem_size())
                         .clamp_radii_for_quad_size(visible.size);
                     window
-                        .paint_image_fitted_with_sampling(
+                        .paint_image_fitted_with_sampling_and_filter(
                             visible,
                             fitted,
                             corner_radii,
@@ -520,6 +534,7 @@ impl Element for Img {
                             layout_state.frame_index,
                             self.style.grayscale,
                             self.style.sampling,
+                            self.style.filter,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
@@ -853,6 +868,14 @@ mod tests {
         assert_eq!(linear.style.sampling, ImageSampling::Linear);
         let pixelated = linear.pixelated();
         assert_eq!(pixelated.style.sampling, ImageSampling::Pixelated);
+    }
+
+    #[test]
+    fn image_filter_is_none_by_default_and_invert_is_explicit() {
+        let plain = img(ImageSource::Render(test_image(1)));
+        assert_eq!(plain.style.filter, ImageFilter::None);
+        let inverted = plain.invert();
+        assert_eq!(inverted.style.filter, ImageFilter::Invert);
     }
 
     /// Overwrites the cached `frame_index` of the sibling `img` during paint.

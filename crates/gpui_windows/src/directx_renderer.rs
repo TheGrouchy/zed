@@ -396,10 +396,12 @@ impl DirectXRenderer {
                 PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     sampling,
+                    filter,
                     range,
                 } => self.draw_polychrome_sprites(
                     texture_id,
                     sampling,
+                    filter,
                     range.start,
                     range.len(),
                 ),
@@ -904,6 +906,7 @@ impl DirectXRenderer {
         &mut self,
         texture_id: AtlasTextureId,
         sampling: ImageSampling,
+        _filter: ImageFilter,
         start: usize,
         len: usize,
     ) -> Result<()> {
@@ -2152,7 +2155,7 @@ pub(crate) mod shader_resources {
         }
 
         #[test]
-        fn image_sampling_shaders_compile_with_fxc() {
+        fn image_sampling_and_filter_shaders_compile_with_fxc() {
             build_shader_blob(ShaderModule::PolychromeSprite, ShaderTarget::Vertex)
                 .expect("polychrome image vertex shader must compile");
             build_shader_blob(ShaderModule::PolychromeSprite, ShaderTarget::Fragment)

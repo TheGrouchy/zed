@@ -66,6 +66,7 @@ mod macos_build {
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),
             "ImageSampling".into(),
+            "ImageFilter".into(),
             "PolychromeSprite".into(),
             "PathSprite".into(),
             "SurfaceInputIndex".into(),

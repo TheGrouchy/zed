@@ -1,0 +1,56 @@
+{
+  "oracle": "Chromium headless transparent PNG",
+  "chromiumVersion": "151.0.7922.170",
+  "deviceScaleFactor": 1,
+  "lockedSource": "platform/v2/routes.css img.int-logo.inv { filter: invert(1) }",
+  "lockedAsset": "platform/integration-logos/mparticle-favicon.png",
+  "sourcePngSha256": "4936A82C01E3E31DBDCD175323551B3E331838A90719B91A4CDAA931132D579D",
+  "sourceRgbaSha256": "7E01940BEC10785762936DF13841D84DEF7E264B7577AF724D59326BEDDDA5D9",
+  "sourceSize": [
+    48,
+    48
+  ],
+  "lockedRuntimeSize": [
+    16,
+    16
+  ],
+  "sourceAlphaCounts": {
+    "transparent": 1068,
+    "partial": 544,
+    "opaque": 692
+  },
+  "premultipliedFormula": "rgb_out = alpha - rgb_in; alpha_out = alpha",
+  "pngSha256": "3AC76B23001010555791A2F9672B70A5A87217FC8FF8271053A4525781948F34",
+  "rgbaPlaneSha256": "6E7CFC0F0549FB7D4FFBDAF950451A37DC88061D0053810E8929583616E60174",
+  "cases": {
+    "mparticleNormal": {
+      "rgbaOffset": 0,
+      "rgbaLength": 1024,
+      "rgbaSha256": "E416FAE738EC5FEC22E88E00850A6BEF9C1A80B547D70F9A8B0E677C8FD30AE0"
+    },
+    "mparticleInvert": {
+      "rgbaOffset": 1024,
+      "rgbaLength": 1024,
+      "rgbaSha256": "8D27F3C786B7DB46480BB1F3936F030FAE3D8F5589E2C19DF375013DDA459470"
+    },
+    "alphaEdgesInvert": {
+      "sourceRgba": [
+        17,
+        33,
+        49,
+        0,
+        64,
+        128,
+        192,
+        128,
+        10,
+        20,
+        30,
+        255
+      ],
+      "rgbaOffset": 2048,
+      "rgbaLength": 12,
+      "rgbaSha256": "597064A8EBACD9E767C4190D21CC8BDA51B7E0E6845AB32A6CDF67C9E7115960"
+    }
+  }
+}
