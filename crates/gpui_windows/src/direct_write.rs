@@ -2492,6 +2492,7 @@ mod tests {
         FontRun, FontStyle, FontWeight, Pixels, PlatformTextSystem, TextRun, TextSystem,
         WhiteSpace, WindowTextSystem, font, prepare_whitespace,
     };
+    use windows::core::{IUnknown, Interface};
 
     const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
     const LILEX_BOLD: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf");
@@ -2698,39 +2699,24 @@ mod tests {
         let system = DirectWriteTextSystem::new(&devices).unwrap();
         system.add_css_font_faces(css_weight_registry()).unwrap();
 
-        let regular_id = system
-            .font_id(&font(".GPUIEmbeddedFont.weight-400"))
-            .unwrap();
-        let bold_id = system
-            .font_id(&font(".GPUIEmbeddedFont.weight-700"))
-            .unwrap();
+        let physical_face_key = |font: &gpui::Font| {
+            let font_id = system.font_id(font).unwrap();
+            system.state.read().fonts[font_id.0]
+                .font_face
+                .cast::<IUnknown>()
+                .unwrap()
+                .as_raw()
+                .addr()
+        };
+        let regular_key = physical_face_key(&font(".GPUIEmbeddedFont.weight-400"));
+        let bold_key = physical_face_key(&font(".GPUIEmbeddedFont.weight-700"));
         let mut medium = font("Waypath CSS Weight");
         medium.weight = FontWeight::MEDIUM;
-        let medium_id = system.font_id(&medium).unwrap();
-        let medium_layout = system.layout_line(
-            "A",
-            Pixels::from(32.0),
-            &[FontRun {
-                len: 1,
-                font_id: medium_id,
-                letter_spacing: Pixels::ZERO,
-            }],
-        );
-        assert_eq!(medium_layout.runs[0].font_id, regular_id);
+        assert_eq!(physical_face_key(&medium), regular_key);
 
         let mut semibold = font("Waypath CSS Weight");
         semibold.weight = FontWeight::SEMIBOLD;
-        let semibold_id = system.font_id(&semibold).unwrap();
-        let semibold_layout = system.layout_line(
-            "A",
-            Pixels::from(32.0),
-            &[FontRun {
-                len: 1,
-                font_id: semibold_id,
-                letter_spacing: Pixels::ZERO,
-            }],
-        );
-        assert_eq!(semibold_layout.runs[0].font_id, bold_id);
+        assert_eq!(physical_face_key(&semibold), bold_key);
 
         let mut italic = font("Waypath CSS Weight");
         italic.style = FontStyle::Italic;
