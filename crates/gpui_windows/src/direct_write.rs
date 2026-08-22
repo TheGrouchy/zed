@@ -618,16 +618,35 @@ impl DirectWriteState {
                 .log_err()?;
         }
         let family_exists = family_exists.as_bool();
-        let mut font = if family_exists {
-            unsafe {
-                fontset
-                    .GetMatchingFonts(
-                        &font_family_h,
-                        font_weight_to_dwrite(weight),
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        font_style_to_dwrite(style),
-                    )
-                    .log_err()?
+        let font = if family_exists {
+            if style == FontStyle::Normal {
+                let weight_axis = DWRITE_FONT_AXIS_VALUE {
+                    axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
+                    value: weight.0,
+                };
+                let fontset: IDWriteFontSet4 = fontset.cast().log_err()?;
+                unsafe {
+                    fontset
+                        .GetMatchingFonts(
+                            &font_family_h,
+                            &[weight_axis],
+                            DWRITE_FONT_SIMULATIONS_NONE,
+                        )
+                        .log_err()?
+                        .cast()
+                        .log_err()?
+                }
+            } else {
+                unsafe {
+                    fontset
+                        .GetMatchingFonts(
+                            &font_family_h,
+                            font_weight_to_dwrite(weight),
+                            DWRITE_FONT_STRETCH_NORMAL,
+                            font_style_to_dwrite(style),
+                        )
+                        .log_err()?
+                }
             }
         } else {
             let full_name_property = DWRITE_FONT_PROPERTY {
@@ -650,24 +669,6 @@ impl DirectWriteState {
             }
             font
         };
-        if family_exists
-            && unsafe { font.GetFontCount() } > 0
-            && let Ok(fontset_with_axes) = font.cast::<IDWriteFontSet1>()
-        {
-            let weight_axis = DWRITE_FONT_AXIS_VALUE {
-                axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
-                value: weight.0,
-            };
-            if let Some(instanced) = unsafe {
-                fontset_with_axes
-                    .GetMatchingFonts(None, &[weight_axis])
-                    .log_err()
-            } && unsafe { instanced.GetFontCount() } > 0
-                && let Ok(instanced) = instanced.cast::<IDWriteFontSet>()
-            {
-                font = instanced;
-            }
-        }
         let total_number = unsafe { font.GetFontCount() };
         for index in 0..total_number {
             let res = maybe!({
