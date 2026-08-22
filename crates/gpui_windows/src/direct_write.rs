@@ -181,6 +181,87 @@ impl DirectWriteTextSystem {
         }
     }
 
+    unsafe fn add_static_face_aliases(
+        components: &DirectWriteComponents,
+        font_file: &IDWriteFontFile,
+    ) -> Result<()> {
+        // DirectWrite text layouts select by family/weight/style, not by the
+        // exact face reference cached by GPUI. Preserve static subfaces whose
+        // full or PostScript name is used as a CSS family by adding those names
+        // as deterministic family aliases in the custom collection.
+        let temporary_builder = unsafe { components.factory.CreateFontSetBuilder()? };
+        unsafe { temporary_builder.AddFontFile(font_file)? };
+        let temporary_set = unsafe { temporary_builder.CreateFontSet()? };
+        let font_count = unsafe { temporary_set.GetFontCount() };
+        for index in 0..font_count {
+            let face_reference = unsafe { temporary_set.GetFontFaceReference(index)? };
+            let face = unsafe { face_reference.CreateFontFace()? };
+            let face: IDWriteFontFace5 = face.cast()?;
+            if unsafe { face.HasVariations().as_bool() } {
+                continue;
+            }
+
+            let mut aliases = Vec::new();
+            for property_id in [
+                DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+                DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
+            ] {
+                let mut exists = BOOL::default();
+                let mut values = None;
+                unsafe {
+                    temporary_set.GetPropertyValues3(
+                        index,
+                        property_id,
+                        &mut exists,
+                        &mut values,
+                    )?;
+                }
+                if !exists.as_bool() {
+                    continue;
+                }
+                let Some(values) = values else {
+                    continue;
+                };
+                let alias = get_name(values, &components.locale)?;
+                if !aliases.contains(&alias) {
+                    aliases.push(alias);
+                }
+            }
+
+            for alias in aliases {
+                let alias = HSTRING::from(alias);
+                let weight = HSTRING::from(unsafe { face.GetWeight().0 }.to_string());
+                // When any custom properties are supplied DirectWrite does not
+                // derive the omitted informational properties from the face.
+                // Family, full name, and weight are the minimum complete set
+                // required for a selectable custom-family entry.
+                let properties = [
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_FAMILY_NAME,
+                        propertyValue: PCWSTR(alias.as_ptr()),
+                        localeName: DEFAULT_LOCALE_NAME,
+                    },
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+                        propertyValue: PCWSTR(alias.as_ptr()),
+                        localeName: DEFAULT_LOCALE_NAME,
+                    },
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_WEIGHT,
+                        propertyValue: PCWSTR(weight.as_ptr()),
+                        localeName: PCWSTR::null(),
+                    },
+                ];
+                unsafe {
+                    components
+                        .builder
+                        .AddFontFaceReference(&face_reference, &properties)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
         let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         // The `IDWriteInMemoryFontFileLoader` here is supported starting from
@@ -370,7 +451,7 @@ impl DirectWriteState {
         fonts: Vec<Cow<'static, [u8]>>,
     ) -> Result<()> {
         for font_data in fonts {
-            match font_data {
+            let (font_file, alias_font_file) = match font_data {
                 Cow::Borrowed(data) => unsafe {
                     let font_file = components
                         .in_memory_loader
@@ -380,7 +461,15 @@ impl DirectWriteState {
                             data.len() as _,
                             None,
                         )?;
-                    components.builder.AddFontFile(&font_file)?;
+                    let alias_font_file = components
+                        .in_memory_loader
+                        .CreateInMemoryFontFileReference(
+                            &components.factory,
+                            data.as_ptr().cast(),
+                            data.len() as _,
+                            None,
+                        )?;
+                    (font_file, alias_font_file)
                 },
                 Cow::Owned(data) => unsafe {
                     let font_file = components
@@ -391,8 +480,20 @@ impl DirectWriteState {
                             data.len() as _,
                             None,
                         )?;
-                    components.builder.AddFontFile(&font_file)?;
+                    let alias_font_file = components
+                        .in_memory_loader
+                        .CreateInMemoryFontFileReference(
+                            &components.factory,
+                            data.as_ptr().cast(),
+                            data.len() as _,
+                            None,
+                        )?;
+                    (font_file, alias_font_file)
                 },
+            };
+            unsafe {
+                components.builder.AddFontFile(&font_file)?;
+                DirectWriteTextSystem::add_static_face_aliases(components, &alias_font_file)?;
             }
         }
         let set = unsafe { components.builder.CreateFontSet()? };
@@ -2048,7 +2149,16 @@ mod tests {
     #[test]
     fn custom_font_full_name_selects_a_typographic_subfamily() {
         let system = letter_spacing_system();
-        assert!(system.all_font_names().iter().any(|name| name == "Lilex"));
+        let names = system.all_font_names();
+        assert!(names.iter().any(|name| name == "Lilex"));
+        assert!(
+            names.iter().any(|name| name == "Lilex Regular"),
+            "registered names: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "Lilex-Regular"),
+            "registered names: {names:?}"
+        );
         system.font_id(&font("Lilex Regular")).unwrap();
         system.font_id(&font("Lilex-Regular")).unwrap();
     }
