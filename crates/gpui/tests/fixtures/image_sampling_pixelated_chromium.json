@@ -1,0 +1,62 @@
+{
+  "oracle": "Chromium headless transparent PNG",
+  "chromiumVersion": "151.0.7922.170",
+  "deviceScaleFactor": 1,
+  "source": "platform/v2/views.jsx PixelAvatar seed=3",
+  "sourceSize": [
+    8,
+    8
+  ],
+  "sourceRgbaSha256": "3F1029EB5C28587A9DCA4EF8340485718106689D897FE00AEA03716408B24203",
+  "sourceRgbaOffset": 8240,
+  "sourceRgbaLength": 256,
+  "lockedCss": "image-rendering: pixelated",
+  "lockedRuntimeSizes": [
+    22,
+    26,
+    30
+  ],
+  "pngSha256": "51F6201B03B00D20E2344D48471A3BDF0ACD97C4EF5AB40CA4C532B9DB189348",
+  "rgbaPlaneSha256": "A21D370C9051D97B43FE6A0FD69296CA6A0A887634FF931C10E0E63817D83AB4",
+  "cases": {
+    "avatar22": {
+      "sourceSize": [
+        8,
+        8
+      ],
+      "outputSize": [
+        22,
+        22
+      ],
+      "rgbaSha256": "B34FEEB337325BC35904E4E987D713B162ED4206AEF0303162482D81CAC4FBBB",
+      "rgbaOffset": 0,
+      "rgbaLength": 1936
+    },
+    "avatar26": {
+      "sourceSize": [
+        8,
+        8
+      ],
+      "outputSize": [
+        26,
+        26
+      ],
+      "rgbaSha256": "A06DFBA615E61524112BFA86F9273863616959FD699EFAE395DC11DE996C7B94",
+      "rgbaOffset": 1936,
+      "rgbaLength": 2704
+    },
+    "avatar30": {
+      "sourceSize": [
+        8,
+        8
+      ],
+      "outputSize": [
+        30,
+        30
+      ],
+      "rgbaSha256": "12FA7AAF2EB85874AE2200262E06A99F1389402359AEDA7FEAA66EEE175E29C8",
+      "rgbaOffset": 4640,
+      "rgbaLength": 3600
+    }
+  }
+}

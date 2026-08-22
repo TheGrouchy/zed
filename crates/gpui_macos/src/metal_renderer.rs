@@ -8,9 +8,9 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, DrawOrder,
-    LinearGradientMaskParams, MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite,
-    PrimitiveBatch, Quad, ScaledPixels, ScaledTextShadow, Scene, Shadow, Size, Surface,
-    TextShadowGroup, Underline, point, size,
+    ImageSampling, LinearGradientMaskParams, MonochromeSprite, PaintSurface, Path, Point,
+    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, ScaledTextShadow, Scene, Shadow, Size,
+    Surface, TextShadowGroup, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -179,6 +179,7 @@ pub(crate) struct MetalRenderer {
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    pixelated_polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
@@ -413,6 +414,14 @@ impl MetalRenderer {
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let pixelated_polychrome_sprites_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "pixelated_polychrome_sprites",
+            "polychrome_sprite_vertex",
+            "pixelated_polychrome_sprite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -452,6 +461,7 @@ impl MetalRenderer {
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
+            pixelated_polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
@@ -1220,15 +1230,19 @@ impl MetalRenderer {
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                    .draw_polychrome_sprites(
-                        texture_id,
-                        &scene.polychrome_sprites[range],
-                        instance_buffer,
-                        &mut instance_offset,
-                        viewport_size,
-                        command_encoder,
-                    ),
+                PrimitiveBatch::PolychromeSprites {
+                    texture_id,
+                    sampling,
+                    range,
+                } => self.draw_polychrome_sprites(
+                    texture_id,
+                    sampling,
+                    &scene.polychrome_sprites[range],
+                    instance_buffer,
+                    &mut instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range],
                     instance_buffer,
@@ -1522,15 +1536,19 @@ impl MetalRenderer {
                         viewport_size,
                         command_encoder,
                     ),
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                    .draw_polychrome_sprites(
-                        texture_id,
-                        &scene.polychrome_sprites[range],
-                        instance_buffer,
-                        instance_offset,
-                        viewport_size,
-                        command_encoder,
-                    ),
+                PrimitiveBatch::PolychromeSprites {
+                    texture_id,
+                    sampling,
+                    range,
+                } => self.draw_polychrome_sprites(
+                    texture_id,
+                    sampling,
+                    &scene.polychrome_sprites[range],
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::SubpixelSprites { .. }
                 | PrimitiveBatch::Surfaces(_)
                 | PrimitiveBatch::TextShadowGroup(_)
@@ -2249,6 +2267,7 @@ impl MetalRenderer {
     fn draw_polychrome_sprites(
         &self,
         texture_id: AtlasTextureId,
+        sampling: ImageSampling,
         sprites: &[PolychromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
@@ -2265,7 +2284,10 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(match sampling {
+            ImageSampling::Linear => &self.polychrome_sprites_pipeline_state,
+            ImageSampling::Pixelated => &self.pixelated_polychrome_sprites_pipeline_state,
+        });
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),

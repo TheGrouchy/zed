@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body {
+    width: 96px;
+    height: 30px;
+    margin: 0;
+    overflow: hidden;
+    background: transparent;
+  }
+  canvas {
+    position: absolute;
+    top: 0;
+    image-rendering: pixelated;
+  }
+  #avatar22 { left: 0; width: 22px; height: 22px; }
+  #avatar26 { left: 30px; width: 26px; height: 26px; }
+  #avatar30 { left: 66px; width: 30px; height: 30px; }
+</style>
+<canvas id="avatar22"></canvas>
+<canvas id="avatar26"></canvas>
+<canvas id="avatar30"></canvas>
+<script>
+  // Exact locked PixelAvatar algorithm and seed, isolated from its separately
+  // composited circular background so this fixture proves only sampling.
+  const palette = ["#b78bff", "#e0cffd"];
+  function paint(canvas, seed) {
+    const P = 8;
+    canvas.width = P;
+    canvas.height = P;
+    const ctx = canvas.getContext("2d");
+    let h = (seed * 2654435761) >>> 0;
+    const rnd = () => {
+      h ^= h << 13; h >>>= 0;
+      h ^= h >> 17;
+      h ^= h << 5; h >>>= 0;
+      return h / 4294967295;
+    };
+    ctx.clearRect(0, 0, P, P);
+    for (let y = 0; y < P; y++) {
+      for (let x = 0; x < 4; x++) {
+        const edge = y === 0 || y === P - 1;
+        if (rnd() > (edge ? 0.78 : 0.44)) {
+          ctx.fillStyle = rnd() > 0.72 ? palette[1] : palette[0];
+          ctx.fillRect(x, y, 1, 1);
+          ctx.fillRect(P - 1 - x, y, 1, 1);
+        }
+      }
+    }
+  }
+  paint(document.getElementById("avatar22"), 3);
+  paint(document.getElementById("avatar26"), 3);
+  paint(document.getElementById("avatar30"), 3);
+</script>

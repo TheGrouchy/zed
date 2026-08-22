@@ -6,17 +6,17 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, LinearGradientMask, LinearGradientMaskGroupError,
-    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextShadow, TextShadowGroupError, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    Hsla, ImageSampling, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LinearGradientMask,
+    LinearGradientMaskGroupError, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextShadow, TextShadowGroupError,
+    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
     transparent_black, white,
@@ -4540,7 +4540,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                sampling: ImageSampling::Linear,
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -4630,7 +4630,35 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
-        self.paint_image_fitted(bounds, bounds, corner_radii, data, frame_index, grayscale)
+        self.paint_image_with_sampling(
+            bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            ImageSampling::Linear,
+        )
+    }
+
+    /// Paint an image with an explicit texture sampling mode.
+    pub fn paint_image_with_sampling(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        sampling: ImageSampling,
+    ) -> Result<()> {
+        self.paint_image_fitted_with_sampling(
+            bounds,
+            bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            sampling,
+        )
     }
 
     /// [`Self::paint_image`] for object-fit layouts: paint the `visible`
@@ -4649,9 +4677,41 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_fitted_with_sampling(
+            visible,
+            fitted,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            ImageSampling::Linear,
+        )
+    }
+
+    fn validate_image_sampling(sampling: ImageSampling, cropped: bool) -> Result<()> {
+        if sampling == ImageSampling::Pixelated && cropped {
+            return Err(anyhow!(
+                "pixelated image sampling with object-fit cropping is not certified"
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::paint_image_fitted`] with an explicit texture sampling mode.
+    pub fn paint_image_fitted_with_sampling(
+        &mut self,
+        visible: Bounds<Pixels>,
+        fitted: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        sampling: ImageSampling,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let crop = (visible != fitted).then_some((visible, fitted));
+        Self::validate_image_sampling(sampling, crop.is_some())?;
         let bounds = self.snap_bounds(visible);
         let params = RenderImageParams {
             image_id: data.id,
@@ -4701,7 +4761,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            sampling,
             grayscale: grayscale.into(),
             bounds,
             content_mask,
@@ -6966,7 +7026,7 @@ pub fn outline(
 mod tests {
     use crate::{
         AppContext as _, AtlasKey, AtlasTextureKind, Bounds, Context, FocusHandle, FontId, GlyphId,
-        InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
+        ImageSampling, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
         RenderGlyphParams, Styled as _, TestAppContext, Window, canvas, div, point, px, size,
     };
     use std::{cell::Cell, rc::Rc};
@@ -7064,6 +7124,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
+    }
+
+    #[test]
+    fn pixelated_image_sampling_rejects_uncertified_object_fit_crops() {
+        assert!(Window::validate_image_sampling(ImageSampling::Linear, true).is_ok());
+        assert!(Window::validate_image_sampling(ImageSampling::Pixelated, false).is_ok());
+        assert!(Window::validate_image_sampling(ImageSampling::Pixelated, true).is_err());
     }
 
     struct FocusForwarder {

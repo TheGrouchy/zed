@@ -105,6 +105,7 @@ struct DirectXRenderPipelines {
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    pixelated_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -392,9 +393,16 @@ impl DirectXRenderer {
                 PrimitiveBatch::SubpixelSprites { texture_id, range } => {
                     self.draw_subpixel_sprites(texture_id, range.start, range.len())
                 }
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                    self.draw_polychrome_sprites(texture_id, range.start, range.len())
-                }
+                PrimitiveBatch::PolychromeSprites {
+                    texture_id,
+                    sampling,
+                    range,
+                } => self.draw_polychrome_sprites(
+                    texture_id,
+                    sampling,
+                    range.start,
+                    range.len(),
+                ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
                 PrimitiveBatch::LinearGradientMaskGroup(index) => {
                     self.draw_linear_gradient_mask_group(
@@ -895,6 +903,7 @@ impl DirectXRenderer {
     fn draw_polychrome_sprites(
         &mut self,
         texture_id: AtlasTextureId,
+        sampling: ImageSampling,
         start: usize,
         len: usize,
     ) -> Result<()> {
@@ -904,13 +913,17 @@ impl DirectXRenderer {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
         let texture_view = self.atlas.get_texture_view(texture_id);
+        let sampler = match sampling {
+            ImageSampling::Linear => &self.globals.sampler,
+            ImageSampling::Pixelated => &self.globals.pixelated_sampler,
+        };
         self.pipelines.poly_sprites.draw_range_with_texture(
             &devices.device,
             &devices.device_context,
             &texture_view,
             slice::from_ref(&resources.viewport),
             slice::from_ref(&self.globals.global_params_buffer),
-            slice::from_ref(&self.globals.sampler),
+            slice::from_ref(sampler),
             start as u32,
             len as u32,
         )
@@ -1214,9 +1227,28 @@ impl DirectXGlobalElements {
             output
         };
 
+        let pixelated_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
+                AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
+                AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             sampler,
+            pixelated_sampler,
         })
     }
 }
@@ -2117,6 +2149,14 @@ pub(crate) mod shader_resources {
                 build_shader_blob(module, ShaderTarget::Fragment)
                     .expect("text-shadow fragment shader must compile");
             }
+        }
+
+        #[test]
+        fn image_sampling_shaders_compile_with_fxc() {
+            build_shader_blob(ShaderModule::PolychromeSprite, ShaderTarget::Vertex)
+                .expect("polychrome image vertex shader must compile");
+            build_shader_blob(ShaderModule::PolychromeSprite, ShaderTarget::Fragment)
+                .expect("polychrome image fragment shader must compile");
         }
     }
 }

@@ -957,15 +957,8 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 polychrome_sprite_fragment(
-    PolychromeSpriteFragmentInput input [[stage_in]],
-    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
-  PolychromeSprite sprite = sprites[input.sprite_id];
-  constexpr sampler atlas_texture_sampler(mag_filter::linear,
-                                          min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+float4 shade_polychrome_sprite(PolychromeSpriteFragmentInput input,
+                               PolychromeSprite sprite, float4 sample) {
   float distance =
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
@@ -979,6 +972,30 @@ fragment float4 polychrome_sprite_fragment(
   color.a *= sprite.opacity * saturate(0.5 - distance) *
              edge_fade_alpha(input.position.xy, sprite.fade);
   return color;
+}
+
+fragment float4 polychrome_sprite_fragment(
+    PolychromeSpriteFragmentInput input [[stage_in]],
+    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+  PolychromeSprite sprite = sprites[input.sprite_id];
+  constexpr sampler atlas_texture_sampler(mag_filter::linear,
+                                          min_filter::linear);
+  float4 sample =
+      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  return shade_polychrome_sprite(input, sprite, sample);
+}
+
+fragment float4 pixelated_polychrome_sprite_fragment(
+    PolychromeSpriteFragmentInput input [[stage_in]],
+    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+  PolychromeSprite sprite = sprites[input.sprite_id];
+  constexpr sampler atlas_texture_sampler(mag_filter::nearest,
+                                          min_filter::nearest);
+  float4 sample =
+      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  return shade_polychrome_sprite(input, sprite, sample);
 }
 
 struct PathRasterizationVertexOutput {

@@ -22,6 +22,23 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
+/// Texture sampling applied to one polychrome image primitive.
+///
+/// Linear remains the default for existing images. Nearest-neighbor is the
+/// exact GPU primitive used by the locked 8x8 pixel-avatar upscales; CSS
+/// `image-rendering` values with different scale-selection semantics must be
+/// resolved before choosing this finite renderer mode.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[repr(u32)]
+pub enum ImageSampling {
+    /// Bilinear interpolation, preserving GPUI's existing image behavior.
+    #[default]
+    Linear = 0,
+    /// CSS `pixelated` for the locked Chromium canvas path: point sampling at
+    /// the nearest source texel, including the lower-texel boundary tie rule.
+    Pixelated = 1,
+}
+
 /// A cardinal direction for a CSS-compatible linear alpha mask.
 ///
 /// The locked Waypath masks use only `to top`, `to right`, and `to bottom`.
@@ -1451,6 +1468,7 @@ impl<'a> Iterator for BatchIterator<'a> {
             }
             PrimitiveKind::PolychromeSprite => {
                 let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
+                let sampling = self.polychrome_sprites_iter.peek().unwrap().sampling;
                 let sprites_start = self.polychrome_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.polychrome_sprites_iter.next();
@@ -1459,6 +1477,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .next_if(|sprite| {
                         (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
+                            && sprite.sampling == sampling
                     })
                     .is_some()
                 {
@@ -1467,6 +1486,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.polychrome_sprites_start = sprites_end;
                 Some(PrimitiveBatch::PolychromeSprites {
                     texture_id,
+                    sampling,
                     range: sprites_start..sprites_end,
                 })
             }
@@ -1520,6 +1540,7 @@ pub enum PrimitiveBatch {
     },
     PolychromeSprites {
         texture_id: AtlasTextureId,
+        sampling: ImageSampling,
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
@@ -1549,9 +1570,13 @@ impl PrimitiveBatch {
                     texture_id.index
                 )
             }
-            Self::PolychromeSprites { texture_id, range } => {
+            Self::PolychromeSprites {
+                texture_id,
+                sampling,
+                range,
+            } => {
                 format!(
-                    "polychrome sprites ({}) on atlas {}",
+                    "polychrome sprites ({}) on atlas {} with {sampling:?} sampling",
                     range.len(),
                     texture_id.index
                 )
@@ -1818,7 +1843,7 @@ impl From<SubpixelSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    pub sampling: ImageSampling,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
@@ -2854,5 +2879,161 @@ mod text_shadow_tests {
             assert!(renderer.contains("group.shadow_scene"));
             assert!(renderer.contains("group.scene"));
         }
+    }
+}
+
+#[cfg(test)]
+mod image_sampling_tests {
+    use super::*;
+    use crate::{AtlasTextureId, AtlasTextureKind, DevicePixels, TileId, size};
+    use serde_json::Value;
+
+    fn sprite(x: f32, sampling: ImageSampling) -> PolychromeSprite {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.0)),
+            size: size(ScaledPixels(8.0), ScaledPixels(8.0)),
+        };
+        PolychromeSprite {
+            order: 0,
+            sampling,
+            grayscale: false.into(),
+            opacity: 1.0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+            fade: EdgeFadeParams::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 3,
+                    kind: AtlasTextureKind::Polychrome,
+                },
+                tile_id: TileId(7),
+                padding: 0,
+                bounds: Bounds {
+                    origin: point(DevicePixels(4), DevicePixels(6)),
+                    size: size(DevicePixels(8), DevicePixels(8)),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn sampling_is_part_of_batches_and_paint_cache_replay() {
+        assert_eq!(ImageSampling::default(), ImageSampling::Linear);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 128);
+
+        let mut previous = Scene::default();
+        previous.insert_primitive(sprite(0.0, ImageSampling::Linear));
+        previous.insert_primitive(sprite(10.0, ImageSampling::Pixelated));
+        previous.insert_primitive(sprite(20.0, ImageSampling::Linear));
+        previous.finish();
+
+        let modes = previous
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::PolychromeSprites { sampling, .. } => Some(sampling),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modes,
+            [
+                ImageSampling::Linear,
+                ImageSampling::Pixelated,
+                ImageSampling::Linear
+            ]
+        );
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..previous.len(), &previous);
+        replayed.finish();
+        assert_eq!(
+            replayed
+                .polychrome_sprites
+                .iter()
+                .map(|sprite| sprite.sampling)
+                .collect::<Vec<_>>(),
+            [
+                ImageSampling::Linear,
+                ImageSampling::Pixelated,
+                ImageSampling::Linear
+            ]
+        );
+        assert!(
+            replayed
+                .polychrome_sprites
+                .iter()
+                .all(|sprite| sprite.tile.tile_id == TileId(7))
+        );
+    }
+
+    #[test]
+    fn locked_avatar_point_sampling_matches_every_chromium_pixel() {
+        let metadata: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/image_sampling_pixelated_chromium.json"
+        ))
+        .unwrap();
+        let planes = include_bytes!("../tests/fixtures/image_sampling_pixelated_chromium.rgba");
+        assert_eq!(metadata["sourceSize"], serde_json::json!([8, 8]));
+        assert_eq!(
+            metadata["lockedRuntimeSizes"],
+            serde_json::json!([22, 26, 30])
+        );
+
+        let source_offset = metadata["sourceRgbaOffset"].as_u64().unwrap() as usize;
+        let source_length = metadata["sourceRgbaLength"].as_u64().unwrap() as usize;
+        let source = &planes[source_offset..source_offset + source_length];
+        for name in ["avatar22", "avatar26", "avatar30"] {
+            let case = &metadata["cases"][name];
+            let output_size = case["outputSize"][0].as_u64().unwrap() as usize;
+            let offset = case["rgbaOffset"].as_u64().unwrap() as usize;
+            let length = case["rgbaLength"].as_u64().unwrap() as usize;
+            let chromium = &planes[offset..offset + length];
+            let mut expected = Vec::with_capacity(length);
+            for y in 0..output_size {
+                // Chromium and all three native point samplers select the
+                // lower texel when a fragment center lies exactly on a
+                // source-texel boundary.
+                let source_y = (((2 * y + 1) * 8) - 1) / (2 * output_size);
+                for x in 0..output_size {
+                    let source_x = (((2 * x + 1) * 8) - 1) / (2 * output_size);
+                    let source_offset = (source_y * 8 + source_x) * 4;
+                    expected.extend_from_slice(&source[source_offset..source_offset + 4]);
+                }
+            }
+            let mismatch = chromium
+                .chunks_exact(4)
+                .zip(expected.chunks_exact(4))
+                .position(|(actual, expected)| actual != expected);
+            assert_eq!(mismatch, None, "{name} point-sampling mismatch");
+        }
+    }
+
+    #[test]
+    fn every_renderer_has_distinct_linear_and_pixelated_paths() {
+        let directx = include_str!("../../gpui_windows/src/directx_renderer.rs");
+        assert!(directx.contains("D3D11_FILTER_MIN_MAG_MIP_LINEAR"));
+        assert!(directx.contains("D3D11_FILTER_MIN_MAG_MIP_POINT"));
+        assert!(directx.contains("ImageSampling::Pixelated => &self.globals.pixelated_sampler"));
+
+        let wgpu = include_str!("../../gpui_wgpu/src/wgpu_renderer.rs");
+        assert!(wgpu.contains("mag_filter: wgpu::FilterMode::Linear"));
+        assert!(wgpu.contains("mag_filter: wgpu::FilterMode::Nearest"));
+        assert!(wgpu.contains("ImageSampling::Pixelated => &resources.nearest_atlas_sampler"));
+
+        let metal_renderer = include_str!("../../gpui_macos/src/metal_renderer.rs");
+        let metal_shader = include_str!("../../gpui_macos/src/shaders.metal");
+        assert!(metal_renderer.contains("pixelated_polychrome_sprites_pipeline_state"));
+        assert!(metal_shader.contains("mag_filter::linear"));
+        assert!(metal_shader.contains("mag_filter::nearest"));
+        assert!(metal_shader.contains("pixelated_polychrome_sprite_fragment"));
+
+        for shader in [
+            include_str!("../../gpui_windows/src/shaders.hlsl"),
+            include_str!("../../gpui_wgpu/src/shaders.wgsl"),
+        ] {
+            assert!(shader.contains("sampling"));
+        }
+        assert!(include_str!("../../gpui_macos/build.rs").contains("ImageSampling"));
     }
 }
