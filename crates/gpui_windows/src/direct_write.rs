@@ -163,6 +163,24 @@ impl GPUState {
 }
 
 impl DirectWriteTextSystem {
+    unsafe fn create_weight_stretch_style_collection(
+        factory: &IDWriteFactory5,
+        font_set: &IDWriteFontSet,
+    ) -> Result<IDWriteFontCollection1> {
+        let factory = factory
+            .cast::<IDWriteFactory6>()
+            .context("DirectWrite WSS font-family model is unavailable")?;
+        unsafe {
+            factory
+                .CreateFontCollectionFromFontSet(
+                    font_set,
+                    DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE,
+                )?
+                .cast()
+                .context("failed to cast DirectWrite WSS font collection")
+        }
+    }
+
     pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
         let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         // The `IDWriteInMemoryFontFileLoader` here is supported starting from
@@ -199,9 +217,7 @@ impl DirectWriteTextSystem {
         };
         let custom_font_set = unsafe { components.builder.CreateFontSet()? };
         let custom_font_collection = unsafe {
-            components
-                .factory
-                .CreateFontCollectionFromFontSet(&custom_font_set)?
+            Self::create_weight_stretch_style_collection(&components.factory, &custom_font_set)?
         };
 
         Ok(Self {
@@ -380,7 +396,12 @@ impl DirectWriteState {
             }
         }
         let set = unsafe { components.builder.CreateFontSet()? };
-        let collection = unsafe { components.factory.CreateFontCollectionFromFontSet(&set)? };
+        let collection = unsafe {
+            DirectWriteTextSystem::create_weight_stretch_style_collection(
+                &components.factory,
+                &set,
+            )?
+        };
         self.custom_font_collection = collection;
 
         Ok(())
