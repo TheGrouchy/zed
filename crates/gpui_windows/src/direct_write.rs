@@ -492,6 +492,23 @@ impl DirectWriteState {
                 )
                 .log_err()?
         };
+        if unsafe { font.GetFontCount() } > 0
+            && let Ok(fontset_with_axes) = font.cast::<IDWriteFontSet1>()
+        {
+            let weight_axis = DWRITE_FONT_AXIS_VALUE {
+                axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
+                value: weight.0,
+            };
+            if let Some(instanced) = unsafe {
+                fontset_with_axes
+                    .GetMatchingFonts(None, &[weight_axis])
+                    .log_err()
+            } && unsafe { instanced.GetFontCount() } > 0
+                && let Ok(instanced) = instanced.cast::<IDWriteFontSet>()
+            {
+                font = instanced;
+            }
+        }
         if unsafe { font.GetFontCount() } == 0 {
             // DirectWrite groups typographic subfamilies such as the locked
             // `Sudo Outlined` face under one family (`Sudo`). Preserve GPUI's
