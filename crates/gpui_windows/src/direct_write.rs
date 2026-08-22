@@ -30,6 +30,8 @@ use gpui::*;
 struct FontInfo {
     font_family_h: HSTRING,
     font_face: IDWriteFontFace3,
+    requested_weight: DWRITE_FONT_WEIGHT,
+    requested_style: DWRITE_FONT_STYLE,
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
@@ -689,6 +691,8 @@ impl DirectWriteState {
                 let font_info = FontInfo {
                     font_family_h: font_family_h.clone(),
                     font_face,
+                    requested_weight: font_weight_to_dwrite(weight),
+                    requested_style: font_style_to_dwrite(style),
                     features: direct_write_features,
                     fallbacks,
                     font_collection: collection.clone(),
@@ -731,8 +735,8 @@ impl DirectWriteState {
                     .CreateTextFormat(
                         &font_info.font_family_h,
                         collection,
-                        font_info.font_face.GetWeight(),
-                        font_info.font_face.GetStyle(),
+                        font_info.requested_weight,
+                        font_info.requested_style,
                         DWRITE_FONT_STRETCH_NORMAL,
                         font_size.as_f32(),
                         &components.locale,
@@ -795,8 +799,8 @@ impl DirectWriteState {
                     font_size.as_f32()
                 };
                 text_layout.SetFontSize(font_size, text_range)?;
-                text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
-                text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
+                text_layout.SetFontStyle(font_info.requested_style, text_range)?;
+                text_layout.SetFontWeight(font_info.requested_weight, text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
                 text_layout.SetCharacterSpacing(
                     0.0,
