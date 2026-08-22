@@ -313,6 +313,7 @@ impl DirectWriteState {
                     DirectWriteState::make_font_from_font_collection(
                         font,
                         font_collection,
+                        &this.custom_font_collection,
                         &components.factory,
                         &this.system_font_collection,
                         &components.system_ui_font_name,
@@ -388,6 +389,7 @@ impl DirectWriteState {
     fn generate_font_fallbacks(
         fallbacks: &FontFallbacks,
         factory: &IDWriteFactory5,
+        custom_font_collection: &IDWriteFontCollection1,
         system_font_collection: &IDWriteFontCollection1,
     ) -> Result<Option<IDWriteFontFallback>> {
         let fallback_list = fallbacks.fallback_list();
@@ -396,24 +398,30 @@ impl DirectWriteState {
         }
         unsafe {
             let builder = factory.CreateFontFallbackBuilder()?;
-            let font_set = &system_font_collection.GetFontSet()?;
             let mut unicode_ranges = Vec::new();
             for family_name in fallback_list {
                 let family_name = HSTRING::from(family_name);
-                let Some(fonts) = font_set
-                    .GetMatchingFonts(
-                        &family_name,
-                        DWRITE_FONT_WEIGHT_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        DWRITE_FONT_STYLE_NORMAL,
-                    )
-                    .log_err()
-                else {
+                let selected = [custom_font_collection, system_font_collection]
+                    .into_iter()
+                    .find_map(|font_collection| {
+                        let font_set = font_collection.GetFontSet().log_err()?;
+                        let fonts = font_set
+                            .GetMatchingFonts(
+                                &family_name,
+                                DWRITE_FONT_WEIGHT_NORMAL,
+                                DWRITE_FONT_STRETCH_NORMAL,
+                                DWRITE_FONT_STYLE_NORMAL,
+                            )
+                            .log_err()?;
+                        if fonts.GetFontCount() == 0 {
+                            return None;
+                        }
+                        Some((font_collection, fonts))
+                    });
+                let Some((font_collection, fonts)) = selected else {
                     continue;
                 };
-                let Ok(font_face) = fonts.GetFontFaceReference(0) else {
-                    continue;
-                };
+                let font_face = fonts.GetFontFaceReference(0)?;
                 let font = font_face.CreateFontFace()?;
                 let mut count = 0;
                 font.GetUnicodeRanges(None, &mut count).ok();
@@ -431,7 +439,7 @@ impl DirectWriteState {
                 builder.AddMapping(
                     &unicode_ranges,
                     &[family_name.as_ptr()],
-                    None,
+                    Some(&font_collection.cast::<IDWriteFontCollection>()?),
                     None,
                     None,
                     1.0,
@@ -461,6 +469,7 @@ impl DirectWriteState {
             style,
         }: &Font,
         collection: &IDWriteFontCollection1,
+        custom_font_collection: &IDWriteFontCollection1,
         factory: &IDWriteFactory5,
         system_font_collection: &IDWriteFontCollection1,
         system_ui_font_name: &SharedString,
@@ -473,7 +482,7 @@ impl DirectWriteState {
         };
         let fontset = unsafe { collection.GetFontSet().log_err()? };
         let font_family_h = HSTRING::from(family.as_str());
-        let font = unsafe {
+        let mut font = unsafe {
             fontset
                 .GetMatchingFonts(
                     &font_family_h,
@@ -483,6 +492,18 @@ impl DirectWriteState {
                 )
                 .log_err()?
         };
+        if unsafe { font.GetFontCount() } == 0 {
+            // DirectWrite groups typographic subfamilies such as the locked
+            // `Sudo Outlined` face under one family (`Sudo`). Preserve GPUI's
+            // family string as an exact full-name selector before falling
+            // back to the application-wide font stack.
+            let property = DWRITE_FONT_PROPERTY {
+                propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+                propertyValue: PCWSTR(font_family_h.as_ptr()),
+                localeName: PCWSTR::null(),
+            };
+            font = unsafe { fontset.GetMatchingFonts2(&[property]).log_err()? };
+        }
         let total_number = unsafe { font.GetFontCount() };
         for index in 0..total_number {
             let res = maybe!({
@@ -491,9 +512,14 @@ impl DirectWriteState {
                 let direct_write_features =
                     unsafe { Self::generate_font_features(factory, features).log_err()? };
                 let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
-                    Self::generate_font_fallbacks(fallbacks, factory, system_font_collection)
-                        .log_err()
-                        .flatten()
+                    Self::generate_font_fallbacks(
+                        fallbacks,
+                        factory,
+                        custom_font_collection,
+                        system_font_collection,
+                    )
+                    .log_err()
+                    .flatten()
                 });
                 let font_info = FontInfo {
                     font_family_h: font_family_h.clone(),
@@ -1943,9 +1969,9 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 mod tests {
     use std::borrow::Cow;
 
-    use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
     use crate::DirectXDevices;
-    use gpui::{FontRun, Pixels, PlatformTextSystem, font};
+    use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
+    use gpui::{FontFallbacks, FontRun, Pixels, PlatformTextSystem, font};
 
     const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
@@ -1954,6 +1980,49 @@ mod tests {
         let system = DirectWriteTextSystem::new(&devices).unwrap();
         system.add_fonts(vec![Cow::Borrowed(LILEX)]).unwrap();
         system
+    }
+
+    #[test]
+    fn custom_font_full_name_selects_a_typographic_subfamily() {
+        let system = letter_spacing_system();
+        assert!(system.all_font_names().iter().any(|name| name == "Lilex"));
+        system.font_id(&font("Lilex Regular")).unwrap();
+    }
+
+    #[test]
+    fn custom_font_collection_participates_in_fallback_mapping() {
+        let system = letter_spacing_system();
+        let custom_id = system.font_id(&font("Lilex")).unwrap();
+        let primary_id = system.font_id(&font("Arial")).unwrap();
+        let character = (0x20..=0x2fff)
+            .chain(0xe000..=0xf8ff)
+            .filter_map(char::from_u32)
+            .find(|character| {
+                system
+                    .glyph_for_char(custom_id, *character)
+                    .is_some_and(|glyph| glyph.0 != 0)
+                    && system
+                        .glyph_for_char(primary_id, *character)
+                        .is_none_or(|glyph| glyph.0 == 0)
+            })
+            .expect("Lilex fixture must contain a glyph absent from Arial");
+
+        let mut primary_with_custom_fallback = font("Arial");
+        primary_with_custom_fallback.fallbacks =
+            Some(FontFallbacks::from_fonts(vec!["Lilex".to_string()]));
+        let fallback_id = system.font_id(&primary_with_custom_fallback).unwrap();
+        let text = character.to_string();
+        let layout = system.layout_line(
+            &text,
+            Pixels::from(32.0),
+            &[FontRun {
+                len: text.len(),
+                font_id: fallback_id,
+                letter_spacing: Pixels::ZERO,
+            }],
+        );
+        assert_eq!(layout.runs.len(), 1);
+        assert_eq!(layout.runs[0].font_id, custom_id);
     }
 
     fn layout_with_spacing(
