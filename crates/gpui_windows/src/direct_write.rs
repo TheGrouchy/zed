@@ -503,32 +503,22 @@ impl DirectWriteState {
         };
         let fontset = unsafe { collection.GetFontSet().log_err()? };
         let font_family_h = HSTRING::from(family.as_str());
-        // A CSS family may intentionally name a face whose typographic family
-        // is shared with another face (for example a separately supplied
-        // outline face). Resolve an exact full/PostScript name before family
-        // matching so DirectWrite cannot silently return the family's regular
-        // face instead.
-        let full_name_property = DWRITE_FONT_PROPERTY {
-            propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
-            propertyValue: PCWSTR(font_family_h.as_ptr()),
-            localeName: PCWSTR::null(),
-        };
-        let mut font = unsafe { fontset.GetMatchingFonts2(&[full_name_property]).log_err()? };
-        if unsafe { font.GetFontCount() } == 0 {
-            let postscript_property = DWRITE_FONT_PROPERTY {
-                propertyId: DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
-                propertyValue: PCWSTR(font_family_h.as_ptr()),
-                localeName: PCWSTR::null(),
-            };
-            font = unsafe {
-                fontset
-                    .GetMatchingFonts2(&[postscript_property])
-                    .log_err()?
-            };
+        // DirectWrite's property matcher may treat a typographic family alias
+        // as a full-name hit. Prefer family selection whenever the collection
+        // actually contains that family so variable axes remain selectable.
+        // Only use full/PostScript aliases when no exact family exists, which
+        // supports separately supplied faces such as `Sudo Outlined` without
+        // silently selecting the regular `Sudo` family face.
+        let mut family_index = 0;
+        let mut family_exists = BOOL::default();
+        unsafe {
+            collection
+                .FindFamilyName(&font_family_h, &mut family_index, &mut family_exists)
+                .log_err()?;
         }
-        let exact_face_selected = unsafe { font.GetFontCount() } > 0;
-        if !exact_face_selected {
-            font = unsafe {
+        let family_exists = family_exists.as_bool();
+        let mut font = if family_exists {
+            unsafe {
                 fontset
                     .GetMatchingFonts(
                         &font_family_h,
@@ -537,9 +527,29 @@ impl DirectWriteState {
                         font_style_to_dwrite(style),
                     )
                     .log_err()?
+            }
+        } else {
+            let full_name_property = DWRITE_FONT_PROPERTY {
+                propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+                propertyValue: PCWSTR(font_family_h.as_ptr()),
+                localeName: PCWSTR::null(),
             };
-        }
-        if !exact_face_selected
+            let mut font = unsafe { fontset.GetMatchingFonts2(&[full_name_property]).log_err()? };
+            if unsafe { font.GetFontCount() } == 0 {
+                let postscript_property = DWRITE_FONT_PROPERTY {
+                    propertyId: DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
+                    propertyValue: PCWSTR(font_family_h.as_ptr()),
+                    localeName: PCWSTR::null(),
+                };
+                font = unsafe {
+                    fontset
+                        .GetMatchingFonts2(&[postscript_property])
+                        .log_err()?
+                };
+            }
+            font
+        };
+        if family_exists
             && unsafe { font.GetFontCount() } > 0
             && let Ok(fontset_with_axes) = font.cast::<IDWriteFontSet1>()
         {
