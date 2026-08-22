@@ -1,7 +1,7 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, Hsla, JustifyContent, Length, SharedString,
+    FontWeight, GridPlacement, GridTemplate, Hsla, JustifyContent, Length, Pixels, SharedString,
     StrikethroughStyle, StyleRefinement, TemplateColumnMinSize, TextAlign, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
@@ -739,6 +739,15 @@ pub trait Styled: Sized {
     /// Sets the line height of this element and its children.
     fn line_height(mut self, line_height: impl Into<DefiniteLength>) -> Self {
         self.text_style().line_height = Some(line_height.into());
+        self
+    }
+
+    /// Sets additional spacing after each typographic character unit.
+    ///
+    /// This value cascades to child text and participates in shaping,
+    /// measurement, wrapping, hit testing, and text-layout cache identity.
+    fn letter_spacing(mut self, letter_spacing: Pixels) -> Self {
+        self.text_style().letter_spacing = Some(letter_spacing);
         self
     }
 

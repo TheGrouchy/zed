@@ -551,12 +551,10 @@ impl DirectWriteState {
                     format.SetFontFallback(fallbacks)?;
                 }
 
-                let layout = components.factory.CreateTextLayout(
-                    text_wide,
-                    &format,
-                    f32::INFINITY,
-                    f32::INFINITY,
-                )?;
+                let layout: IDWriteTextLayout1 = components
+                    .factory
+                    .CreateTextLayout(text_wide, &format, f32::INFINITY, f32::INFINITY)?
+                    .cast()?;
                 let current_text = &text[utf8_offset..(utf8_offset + first_run.len)];
                 utf8_offset += first_run.len;
                 let current_text_utf16_length = current_text.encode_utf16().count() as u32;
@@ -565,6 +563,12 @@ impl DirectWriteState {
                     length: current_text_utf16_length,
                 };
                 layout.SetTypography(&font_info.features, text_range)?;
+                layout.SetCharacterSpacing(
+                    0.0,
+                    first_run.letter_spacing.as_f32(),
+                    0.0,
+                    text_range,
+                )?;
                 utf16_offset += current_text_utf16_length;
 
                 layout
@@ -603,6 +607,12 @@ impl DirectWriteState {
                 text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
                 text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
+                text_layout.SetCharacterSpacing(
+                    0.0,
+                    run.letter_spacing.as_f32(),
+                    0.0,
+                    text_range,
+                )?;
 
                 break_ligatures = !break_ligatures;
             }
@@ -1931,7 +1941,44 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
-    use crate::direct_write::ClusterAnalyzer;
+    use std::borrow::Cow;
+
+    use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
+    use crate::DirectXDevices;
+    use gpui::{FontRun, Pixels, PlatformTextSystem, font};
+
+    const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+
+    fn letter_spacing_system() -> DirectWriteTextSystem {
+        let devices = DirectXDevices::new().unwrap();
+        let system = DirectWriteTextSystem::new(&devices).unwrap();
+        system.add_fonts(vec![Cow::Borrowed(LILEX)]).unwrap();
+        system
+    }
+
+    fn layout_with_spacing(
+        system: &DirectWriteTextSystem,
+        text: &str,
+        font_id: gpui::FontId,
+        letter_spacing: Pixels,
+    ) -> gpui::LineLayout {
+        system.layout_line(
+            text,
+            Pixels::from(32.0),
+            &[FontRun {
+                len: text.len(),
+                font_id,
+                letter_spacing,
+            }],
+        )
+    }
+
+    fn assert_close(actual: Pixels, expected: Pixels) {
+        assert!(
+            (actual - expected).abs() < Pixels::from(0.02),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
 
     #[test]
     fn test_cluster_map() {
@@ -1968,5 +2015,54 @@ mod tests {
         assert_eq!(next, Some((5, 1)));
         let next = analyzer.next();
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn letter_spacing_shapes_clusters_and_ligatures_in_direct_write() {
+        let system = letter_spacing_system();
+        let normal_font = font("Lilex");
+        let mut spaced_font = normal_font.clone();
+        spaced_font.features = spaced_font
+            .features
+            .with_ligatures_disabled_for_letter_spacing();
+        let normal_id = system.font_id(&normal_font).unwrap();
+        let spaced_id = system.font_id(&spaced_font).unwrap();
+
+        let normal = layout_with_spacing(&system, "ABC", normal_id, Pixels::ZERO);
+        let positive = layout_with_spacing(&system, "ABC", spaced_id, Pixels::from(2.0));
+        let positive_zero = layout_with_spacing(&system, "ABC", spaced_id, Pixels::ZERO);
+        let negative = layout_with_spacing(&system, "ABC", spaced_id, Pixels::from(-1.0));
+        assert_close(positive.width - positive_zero.width, Pixels::from(6.0));
+        assert_close(negative.width - positive_zero.width, Pixels::from(-3.0));
+        assert_eq!(normal.runs.iter().flat_map(|run| &run.glyphs).count(), 3);
+
+        let combining = "q\u{308}";
+        let combining_zero = layout_with_spacing(&system, combining, spaced_id, Pixels::ZERO);
+        let combining_spaced =
+            layout_with_spacing(&system, combining, spaced_id, Pixels::from(2.0));
+        assert_close(
+            combining_spaced.width - combining_zero.width,
+            Pixels::from(2.0),
+        );
+        let combining_indices = combining_spaced
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .collect::<Vec<_>>();
+        assert!(combining_indices.len() > 1);
+        assert!(combining_indices.iter().all(|index| *index == 0));
+
+        let ligature = layout_with_spacing(&system, "ffi", spaced_id, Pixels::from(2.0));
+        let indices = ligature
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        let rtl = "\u{05D0}\u{05D1}\u{05D2}";
+        let rtl_zero = layout_with_spacing(&system, rtl, spaced_id, Pixels::ZERO);
+        let rtl_spaced = layout_with_spacing(&system, rtl, spaced_id, Pixels::from(2.0));
+        assert_close(rtl_spaced.width - rtl_zero.width, Pixels::from(6.0));
     }
 }

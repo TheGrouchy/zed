@@ -450,6 +450,9 @@ pub struct TextStyle {
     /// The line height to use, in pixels or fractions
     pub line_height: DefiniteLength,
 
+    /// Additional space inserted after each typographic character unit.
+    pub letter_spacing: Pixels,
+
     /// The font weight, e.g. bold
     pub font_weight: FontWeight,
 
@@ -488,6 +491,7 @@ impl Default for TextStyle {
             font_fallbacks: None,
             font_size: rems(1.).into(),
             line_height: phi(),
+            letter_spacing: px(0.),
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
             background_color: None,
@@ -566,6 +570,7 @@ impl TextStyle {
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
+            letter_spacing: self.letter_spacing,
         }
     }
 }

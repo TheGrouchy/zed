@@ -165,6 +165,15 @@ impl TextSystem {
         );
     }
 
+    fn resolve_font_for_text_run(&self, run: &TextRun) -> FontId {
+        if run.letter_spacing == Pixels::ZERO {
+            return self.resolve_font(&run.font);
+        }
+        let mut font = run.font.clone();
+        font.features = font.features.with_ligatures_disabled_for_letter_spacing();
+        self.resolve_font(&font)
+    }
+
     /// Get the bounding box for the given font and font size.
     /// A font's bounding box is the smallest rectangle that could enclose all glyphs
     /// in the font. superimposed over one another.
@@ -215,6 +224,7 @@ impl TextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    letter_spacing: Pixels::ZERO,
                 }],
             )
             .width
@@ -553,9 +563,10 @@ impl WindowTextSystem {
                     true
                 };
 
-                let font_id = self.resolve_font(&run.font);
+                let font_id = self.resolve_font_for_text_run(run);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
+                    && run.letter_spacing == font_run.letter_spacing
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -563,6 +574,7 @@ impl WindowTextSystem {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        letter_spacing: run.letter_spacing,
                     });
                 }
 
@@ -667,9 +679,10 @@ impl WindowTextSystem {
                 true
             };
 
-            let font_id = self.resolve_font(&run.font);
+            let font_id = self.resolve_font_for_text_run(run);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.letter_spacing == font_run.letter_spacing
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -677,6 +690,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    letter_spacing: run.letter_spacing,
                 });
             }
         }
@@ -704,6 +718,7 @@ impl WindowTextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    letter_spacing: Pixels::ZERO,
                 }],
                 None,
             )
@@ -749,9 +764,10 @@ impl WindowTextSystem {
                 true
             };
 
-            let font_id = self.resolve_font(&run.font);
+            let font_id = self.resolve_font_for_text_run(run);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.letter_spacing == font_run.letter_spacing
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -759,6 +775,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    letter_spacing: run.letter_spacing,
                 });
             }
         }
@@ -811,9 +828,10 @@ impl WindowTextSystem {
                 true
             };
 
-            let font_id = self.resolve_font(&run.font);
+            let font_id = self.resolve_font_for_text_run(run);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.letter_spacing == font_run.letter_spacing
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -821,6 +839,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    letter_spacing: run.letter_spacing,
                 });
             }
         }
@@ -997,6 +1016,8 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// Additional spacing after each typographic character unit.
+    pub letter_spacing: Pixels,
 }
 
 #[cfg(all(target_os = "macos", test))]

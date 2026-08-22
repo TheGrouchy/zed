@@ -13,6 +13,23 @@ impl FontFeatures {
         Self(Arc::new(vec![("calt".into(), 0)]))
     }
 
+    /// Returns these features with optional ligatures disabled for non-zero
+    /// letter spacing. CSS text layout does not preserve optional ligatures
+    /// when spacing must be inserted between their constituent characters.
+    pub fn with_ligatures_disabled_for_letter_spacing(&self) -> Self {
+        const OPTIONAL_LIGATURE_FEATURES: [&str; 5] = ["calt", "clig", "dlig", "hlig", "liga"];
+        let mut features = self.0.as_ref().clone();
+        for tag in OPTIONAL_LIGATURE_FEATURES {
+            if let Some((_, value)) = features.iter_mut().find(|(feature, _)| feature == tag) {
+                *value = 0;
+            } else {
+                features.push((tag.into(), 0));
+            }
+        }
+        features.sort_by(|left, right| left.0.cmp(&right.0));
+        Self(Arc::new(features))
+    }
+
     /// Get the tag name list of the font OpenType features
     /// only enabled or disabled features are returned
     pub fn tag_value_list(&self) -> &[(String, u32)] {
@@ -151,4 +168,33 @@ impl JsonSchema for FontFeatures {
 
 fn is_valid_feature_tag(tag: &str) -> bool {
     tag.len() == 4 && tag.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letter_spacing_disables_optional_ligatures_without_losing_other_features() {
+        let features = FontFeatures(Arc::new(vec![
+            ("tnum".into(), 1),
+            ("liga".into(), 1),
+            ("ss01".into(), 1),
+        ]));
+        let spaced = features.with_ligatures_disabled_for_letter_spacing();
+
+        assert_eq!(
+            spaced.tag_value_list(),
+            &[
+                ("calt".into(), 0),
+                ("clig".into(), 0),
+                ("dlig".into(), 0),
+                ("hlig".into(), 0),
+                ("liga".into(), 0),
+                ("ss01".into(), 1),
+                ("tnum".into(), 1),
+            ]
+        );
+        assert_eq!(features.tag_value_list()[1], ("liga".into(), 1));
+    }
 }

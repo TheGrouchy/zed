@@ -823,6 +823,7 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    pub letter_spacing: Pixels,
 }
 
 trait AsCacheKeyRef {
@@ -969,6 +970,7 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 mod tests {
     use super::*;
     use crate::GlyphId;
+    use std::collections::hash_map::DefaultHasher;
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
@@ -1104,5 +1106,26 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn letter_spacing_is_part_of_text_layout_cache_identity() {
+        let normal = FontRun {
+            len: 7,
+            font_id: FontId(3),
+            letter_spacing: px(0.),
+        };
+        let spaced = FontRun {
+            letter_spacing: px(1.25),
+            ..normal
+        };
+        assert_ne!(normal, spaced);
+
+        let hash = |run: FontRun| {
+            let mut hasher = DefaultHasher::new();
+            run.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(hash(normal), hash(spaced));
     }
 }

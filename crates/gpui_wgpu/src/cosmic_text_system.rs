@@ -562,8 +562,10 @@ impl CosmicTextSystemState {
             };
         };
 
+        let (spacing_shifts, total_spacing) =
+            visual_letter_spacing_shifts(&layout.glyphs, font_runs);
         let mut runs: Vec<ShapedRun> = Vec::new();
-        for glyph in &layout.glyphs {
+        for (glyph, spacing_shift) in layout.glyphs.iter().zip(spacing_shifts) {
             let mut font_id = FontId(glyph.metadata);
             let mut loaded_font = self.loaded_font(font_id);
             if loaded_font.font.id() != glyph.font_id {
@@ -590,7 +592,7 @@ impl CosmicTextSystemState {
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
-                position: point(glyph.x.into(), glyph.y.into()),
+                position: point((glyph.x + spacing_shift).into(), glyph.y.into()),
                 index: glyph.start,
                 is_emoji,
             };
@@ -610,13 +612,68 @@ impl CosmicTextSystemState {
 
         LineLayout {
             font_size,
-            width: layout.w.into(),
+            width: (layout.w + total_spacing).into(),
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),
             runs,
             len: text.len(),
         }
     }
+}
+
+fn letter_spacing_for_index(font_runs: &[FontRun], index: usize) -> f32 {
+    let mut start = 0;
+    for run in font_runs {
+        let end = start + run.len;
+        if index < end {
+            return run.letter_spacing.as_f32();
+        }
+        start = end;
+    }
+    0.0
+}
+
+fn visual_letter_spacing_shifts(
+    glyphs: &[cosmic_text::LayoutGlyph],
+    font_runs: &[FontRun],
+) -> (Vec<f32>, f32) {
+    let mut clusters = Vec::<(usize, usize, f32, f32)>::new();
+    for glyph in glyphs {
+        if let Some(cluster) = clusters
+            .iter_mut()
+            .find(|cluster| cluster.0 == glyph.start && cluster.1 == glyph.end)
+        {
+            cluster.2 = cluster.2.min(glyph.x);
+        } else {
+            clusters.push((
+                glyph.start,
+                glyph.end,
+                glyph.x,
+                letter_spacing_for_index(font_runs, glyph.start),
+            ));
+        }
+    }
+    clusters.sort_by(|left, right| left.2.total_cmp(&right.2));
+
+    let mut accumulated = 0.0;
+    let cluster_shifts = clusters
+        .into_iter()
+        .map(|(start, end, _, spacing)| {
+            let shift = accumulated;
+            accumulated += spacing;
+            (start, end, shift)
+        })
+        .collect::<Vec<_>>();
+    let shifts = glyphs
+        .iter()
+        .map(|glyph| {
+            cluster_shifts
+                .iter()
+                .find(|(start, end, _)| *start == glyph.start && *end == glyph.end)
+                .map_or(0.0, |(_, _, shift)| *shift)
+        })
+        .collect();
+    (shifts, accumulated)
 }
 
 #[cfg(feature = "font-kit")]
@@ -866,6 +923,38 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 mod tests {
     use super::*;
 
+    const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+
+    fn letter_spacing_system() -> CosmicTextSystem {
+        let system = CosmicTextSystem::new_without_system_fonts("Lilex");
+        system.add_fonts(vec![Cow::Borrowed(LILEX)]).unwrap();
+        system
+    }
+
+    fn layout_with_spacing(
+        system: &CosmicTextSystem,
+        text: &str,
+        font_id: FontId,
+        letter_spacing: Pixels,
+    ) -> LineLayout {
+        system.layout_line(
+            text,
+            Pixels::from(32.0),
+            &[FontRun {
+                len: text.len(),
+                font_id,
+                letter_spacing,
+            }],
+        )
+    }
+
+    fn assert_close(actual: Pixels, expected: Pixels) {
+        assert!(
+            (actual - expected).abs() < Pixels::from(0.01),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
     fn fid(i: usize) -> FontId {
         FontId(i)
     }
@@ -1058,5 +1147,127 @@ mod tests {
         let covers = |_: FontId, _: char| true;
         let spans = compute_run_spans("anything", 3, 0, primary, &fb, &covers);
         assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn letter_spacing_changes_measurement_and_glyph_placement_in_both_directions() {
+        let system = letter_spacing_system();
+        let font_id = system.font_id(&gpui::font("Lilex")).unwrap();
+        let normal = layout_with_spacing(&system, "ABC", font_id, Pixels::ZERO);
+        let positive = layout_with_spacing(&system, "ABC", font_id, Pixels::from(2.0));
+        let negative = layout_with_spacing(&system, "ABC", font_id, Pixels::from(-1.0));
+
+        assert_close(positive.width - normal.width, Pixels::from(6.0));
+        assert_close(negative.width - normal.width, Pixels::from(-3.0));
+        assert_close(
+            positive.runs[0].glyphs[1].position.x - normal.runs[0].glyphs[1].position.x,
+            Pixels::from(2.0),
+        );
+        assert_close(
+            positive.runs[0].glyphs[2].position.x - normal.runs[0].glyphs[2].position.x,
+            Pixels::from(4.0),
+        );
+    }
+
+    #[test]
+    fn letter_spacing_keeps_combining_marks_in_one_typographic_unit() {
+        let system = letter_spacing_system();
+        let font_id = system.font_id(&gpui::font("Lilex")).unwrap();
+        let text = "q\u{308}";
+        let normal = layout_with_spacing(&system, text, font_id, Pixels::ZERO);
+        let spaced = layout_with_spacing(&system, text, font_id, Pixels::from(2.0));
+        assert_close(spaced.width - normal.width, Pixels::from(2.0));
+        let glyphs = spaced
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .collect::<Vec<_>>();
+        assert!(glyphs.len() > 1, "fixture must shape separate base/mark glyphs");
+        assert!(glyphs.iter().all(|glyph| glyph.index == 0));
+    }
+
+    #[test]
+    fn nonzero_letter_spacing_uses_a_ligature_free_font_identity() {
+        let system = letter_spacing_system();
+        let normal_font = gpui::font("Lilex");
+        let mut spaced_font = normal_font.clone();
+        spaced_font.features = spaced_font
+            .features
+            .with_ligatures_disabled_for_letter_spacing();
+        let normal_id = system.font_id(&normal_font).unwrap();
+        let spaced_id = system.font_id(&spaced_font).unwrap();
+        assert_ne!(normal_id, spaced_id);
+
+        let text = "ffi";
+        let spaced_zero = layout_with_spacing(&system, text, spaced_id, Pixels::ZERO);
+        let spaced = layout_with_spacing(&system, text, spaced_id, Pixels::from(2.0));
+        assert_close(spaced.width - spaced_zero.width, Pixels::from(6.0));
+        let indices = spaced
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn letter_spacing_participates_in_wrapping_and_cache_lookup() {
+        let platform = Arc::new(letter_spacing_system());
+        let text_system = Arc::new(gpui::TextSystem::new(platform));
+        let window_text_system = gpui::WindowTextSystem::new(text_system);
+        let text = "AAAA";
+        let normal_run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font("Lilex"),
+            letter_spacing: Pixels::ZERO,
+            ..Default::default()
+        };
+        let spaced_run = gpui::TextRun {
+            letter_spacing: Pixels::from(4.0),
+            ..normal_run.clone()
+        };
+        let normal = window_text_system.layout_line(text, Pixels::from(32.0), &[normal_run.clone()], None);
+        let spaced = window_text_system.layout_line(text, Pixels::from(32.0), &[spaced_run.clone()], None);
+        let normal_again = window_text_system.layout_line(text, Pixels::from(32.0), &[normal_run.clone()], None);
+        assert_close(spaced.width - normal.width, Pixels::from(16.0));
+        assert!(Arc::ptr_eq(&normal, &normal_again));
+        assert!(!Arc::ptr_eq(&normal, &spaced));
+
+        let wrap_width = normal.width + Pixels::from(1.0);
+        let normal_wrapped = window_text_system
+            .shape_text(text.into(), Pixels::from(32.0), &[normal_run], Some(wrap_width), None)
+            .unwrap();
+        let spaced_wrapped = window_text_system
+            .shape_text(text.into(), Pixels::from(32.0), &[spaced_run], Some(wrap_width), None)
+            .unwrap();
+        assert!(normal_wrapped[0].wrap_boundaries().is_empty());
+        assert!(!spaced_wrapped[0].wrap_boundaries().is_empty());
+    }
+
+    #[test]
+    fn letter_spacing_follows_visual_cluster_order_for_rtl_text() {
+        let system = letter_spacing_system();
+        let font_id = system.font_id(&gpui::font("Lilex")).unwrap();
+        let text = "\u{05D0}\u{05D1}\u{05D2}";
+        let normal = layout_with_spacing(&system, text, font_id, Pixels::ZERO);
+        let spaced = layout_with_spacing(&system, text, font_id, Pixels::from(2.0));
+        assert_close(spaced.width - normal.width, Pixels::from(6.0));
+
+        let normal_glyphs = normal.runs.iter().flat_map(|run| &run.glyphs).collect::<Vec<_>>();
+        let spaced_glyphs = spaced.runs.iter().flat_map(|run| &run.glyphs).collect::<Vec<_>>();
+        assert_eq!(normal_glyphs.len(), 3);
+        assert_eq!(spaced_glyphs.len(), 3);
+        assert_eq!(
+            normal_glyphs.iter().map(|glyph| glyph.index).collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        let mut visual = normal_glyphs.iter().zip(spaced_glyphs).collect::<Vec<_>>();
+        visual.sort_by(|left, right| left.0.position.x.cmp(&right.0.position.x));
+        for (visual_index, (normal, spaced)) in visual.into_iter().enumerate() {
+            assert_close(
+                spaced.position.x - normal.position.x,
+                Pixels::from(visual_index as f32 * 2.0),
+            );
+        }
     }
 }
