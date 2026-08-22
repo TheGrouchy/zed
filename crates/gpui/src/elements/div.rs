@@ -128,7 +128,7 @@ impl Interactivity {
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
                     && event.button == button
-                    && hitbox.is_hovered(window)
+                    && hitbox.receives_pointer_event(window)
                 {
                     (listener)(event, window, cx)
                 }
@@ -145,7 +145,7 @@ impl Interactivity {
     ) {
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Capture && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx)
                 }
             }));
@@ -161,7 +161,7 @@ impl Interactivity {
     ) {
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Bubble && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx)
                 }
             }));
@@ -177,7 +177,7 @@ impl Interactivity {
     ) {
         self.mouse_pressure_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Bubble && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx)
                 }
             }));
@@ -193,7 +193,7 @@ impl Interactivity {
     ) {
         self.mouse_pressure_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Capture && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx)
                 }
             }));
@@ -212,7 +212,7 @@ impl Interactivity {
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
                     && event.button == button
-                    && hitbox.is_hovered(window)
+                    && hitbox.receives_pointer_event(window)
                 {
                     (listener)(event, window, cx)
                 }
@@ -229,7 +229,7 @@ impl Interactivity {
     ) {
         self.mouse_up_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Capture && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx)
                 }
             }));
@@ -245,7 +245,7 @@ impl Interactivity {
     ) {
         self.mouse_up_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Bubble && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx)
                 }
             }));
@@ -302,7 +302,7 @@ impl Interactivity {
     ) {
         self.mouse_move_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Bubble && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx);
                 }
             }));
@@ -318,7 +318,7 @@ impl Interactivity {
     ) {
         self.mouse_exit_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Bubble && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx);
                 }
             }));
@@ -379,7 +379,7 @@ impl Interactivity {
     pub fn on_pinch(&mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) {
         self.pinch_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Bubble && hitbox.receives_pointer_event(window) {
                     (listener)(event, window, cx);
                 }
             }));
@@ -676,6 +676,20 @@ impl Interactivity {
     /// The imperative API equivalent to [`InteractiveElement::occlude`]
     pub fn occlude_mouse(&mut self) {
         self.hitbox_behavior = HitboxBehavior::BlockMouse;
+    }
+
+    /// Remove this element from direct pointer targeting while retaining it in
+    /// the event/hover ancestry of an explicitly re-enabled descendant.
+    /// The imperative API equivalent to [`InteractiveElement::pointer_events_none`].
+    pub fn pointer_events_none(&mut self) {
+        self.hitbox_behavior = HitboxBehavior::PointerEventsNone;
+    }
+
+    /// Re-enable pointer targeting for this element and its subtree after an
+    /// ancestor disabled it. The imperative API equivalent to
+    /// [`InteractiveElement::pointer_events_auto`].
+    pub fn pointer_events_auto(&mut self) {
+        self.hitbox_behavior = HitboxBehavior::PointerEventsAuto;
     }
 
     /// Set the bounds of this element as a window control area for the platform window.
@@ -1159,6 +1173,20 @@ pub trait InteractiveElement: Sized {
     /// The fluent API equivalent to [`Interactivity::occlude_mouse`].
     fn occlude(mut self) -> Self {
         self.interactivity().occlude_mouse();
+        self
+    }
+
+    /// Remove this element from direct pointer targeting while retaining it in
+    /// the event/hover ancestry of an explicitly re-enabled descendant.
+    fn pointer_events_none(mut self) -> Self {
+        self.interactivity().pointer_events_none();
+        self
+    }
+
+    /// Re-enable pointer targeting for this element and its subtree after an
+    /// ancestor disabled it.
+    fn pointer_events_auto(mut self) -> Self {
+        self.interactivity().pointer_events_auto();
         self
     }
 
@@ -2747,7 +2775,7 @@ impl Interactivity {
                     move |event: &MouseDownEvent, phase, window, _cx| {
                         if phase == DispatchPhase::Bubble
                             && (event.button == MouseButton::Left || has_aux_click_listeners)
-                            && hitbox.is_hovered(window)
+                            && hitbox.receives_pointer_event(window)
                         {
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
                             window.refresh();
@@ -2863,7 +2891,9 @@ impl Interactivity {
                         // propagation.
                         DispatchPhase::Capture => {
                             let mut pending_mouse_down = pending_mouse_down.borrow_mut();
-                            if pending_mouse_down.is_some() && hitbox.is_hovered(window) {
+                            if pending_mouse_down.is_some()
+                                && hitbox.receives_pointer_event(window)
+                            {
                                 captured_mouse_down = pending_mouse_down.take();
                                 window.refresh();
                             } else if pending_mouse_down.is_some() {
@@ -4120,6 +4150,212 @@ mod tests {
         TestAppContext, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    struct PointerEventsTestView {
+        underlay_clicks: Rc<Cell<usize>>,
+        none_ancestor_clicks: Rc<Cell<usize>>,
+        auto_child_clicks: Rc<Cell<usize>>,
+        underlay_scrolls: Rc<Cell<usize>>,
+        none_ancestor_scrolls: Rc<Cell<usize>>,
+        auto_child_scrolls: Rc<Cell<usize>>,
+        none_ancestor_hovered: Rc<Cell<bool>>,
+        keyboard_events: Rc<Cell<usize>>,
+        focus: FocusHandle,
+    }
+
+    impl Render for PointerEventsTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let underlay_clicks = self.underlay_clicks.clone();
+            let none_ancestor_clicks = self.none_ancestor_clicks.clone();
+            let auto_child_clicks = self.auto_child_clicks.clone();
+            let underlay_scrolls = self.underlay_scrolls.clone();
+            let none_ancestor_scrolls = self.none_ancestor_scrolls.clone();
+            let auto_child_scrolls = self.auto_child_scrolls.clone();
+            let none_ancestor_hovered = self.none_ancestor_hovered.clone();
+            let keyboard_events = self.keyboard_events.clone();
+            div()
+                .id("pointer-root")
+                .relative()
+                .size_full()
+                .pointer_events_auto()
+                .child(
+                    div()
+                        .id("underlay")
+                        .absolute()
+                        .inset_0()
+                        .pointer_events_auto()
+                        .on_click(move |_, _, _| underlay_clicks.set(underlay_clicks.get() + 1))
+                        .on_scroll_wheel(move |_, _, _| {
+                            underlay_scrolls.set(underlay_scrolls.get() + 1)
+                        }),
+                )
+                .child(
+                    div()
+                        .id("none-ancestor")
+                        .absolute()
+                        .inset_0()
+                        .pointer_events_none()
+                        .on_hover(move |hovered, _, _| none_ancestor_hovered.set(*hovered))
+                        .on_click(move |_, _, _| {
+                            none_ancestor_clicks.set(none_ancestor_clicks.get() + 1)
+                        })
+                        .on_scroll_wheel(move |_, _, _| {
+                            none_ancestor_scrolls.set(none_ancestor_scrolls.get() + 1)
+                        })
+                        .child(
+                            div()
+                                .id("inherited-none-child")
+                                .absolute()
+                                .inset_0()
+                                .on_click(|_, _, _| panic!("inherited none child was targeted")),
+                        )
+                        .child(
+                            div()
+                                .id("auto-child")
+                                .absolute()
+                                .left(px(40.))
+                                .top(px(40.))
+                                .size(px(40.))
+                                .pointer_events_auto()
+                                .on_click(move |_, _, _| {
+                                    auto_child_clicks.set(auto_child_clicks.get() + 1)
+                                })
+                                .on_scroll_wheel(move |_, _, _| {
+                                    auto_child_scrolls.set(auto_child_scrolls.get() + 1)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("keyboard-child")
+                                .absolute()
+                                .left(px(100.))
+                                .top(px(40.))
+                                .size(px(40.))
+                                .pointer_events_none()
+                                .track_focus(&self.focus)
+                                .on_key_down(move |_, _, _| {
+                                    keyboard_events.set(keyboard_events.get() + 1)
+                                }),
+                        ),
+                )
+        }
+    }
+
+    fn pointer_click(cx: &mut TestAppContext, window: AnyWindowHandle, position: Point<Pixels>) {
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn pointer_scroll(cx: &mut TestAppContext, window: AnyWindowHandle, position: Point<Pixels>) {
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position,
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(-20.))),
+                    modifiers: Default::default(),
+                    touch_phase: crate::TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn pointer_events_none_passes_through_and_auto_descendant_reenters(cx: &mut TestAppContext) {
+        let underlay_clicks = Rc::new(Cell::new(0));
+        let none_ancestor_clicks = Rc::new(Cell::new(0));
+        let auto_child_clicks = Rc::new(Cell::new(0));
+        let underlay_scrolls = Rc::new(Cell::new(0));
+        let none_ancestor_scrolls = Rc::new(Cell::new(0));
+        let auto_child_scrolls = Rc::new(Cell::new(0));
+        let none_ancestor_hovered = Rc::new(Cell::new(false));
+        let keyboard_events = Rc::new(Cell::new(0));
+        let focus = cx.update(|cx| cx.focus_handle());
+        let window = cx.add_window({
+            let underlay_clicks = underlay_clicks.clone();
+            let none_ancestor_clicks = none_ancestor_clicks.clone();
+            let auto_child_clicks = auto_child_clicks.clone();
+            let underlay_scrolls = underlay_scrolls.clone();
+            let none_ancestor_scrolls = none_ancestor_scrolls.clone();
+            let auto_child_scrolls = auto_child_scrolls.clone();
+            let none_ancestor_hovered = none_ancestor_hovered.clone();
+            let keyboard_events = keyboard_events.clone();
+            let focus = focus.clone();
+            move |_, _| PointerEventsTestView {
+                underlay_clicks,
+                none_ancestor_clicks,
+                auto_child_clicks,
+                underlay_scrolls,
+                none_ancestor_scrolls,
+                auto_child_scrolls,
+                none_ancestor_hovered,
+                keyboard_events,
+                focus,
+            }
+        });
+        let window = AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+
+        pointer_click(cx, window, point(px(10.), px(10.)));
+        assert_eq!(underlay_clicks.get(), 1);
+        assert_eq!(none_ancestor_clicks.get(), 0);
+        assert_eq!(auto_child_clicks.get(), 0);
+        pointer_scroll(cx, window, point(px(10.), px(10.)));
+        assert_eq!(underlay_scrolls.get(), 1);
+        assert_eq!(none_ancestor_scrolls.get(), 0);
+        assert_eq!(auto_child_scrolls.get(), 0);
+
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_mouse_move(point(px(50.), px(50.)), cx)
+        })
+        .unwrap();
+        assert!(!none_ancestor_hovered.get());
+        pointer_click(cx, window, point(px(50.), px(50.)));
+        assert_eq!(underlay_clicks.get(), 1);
+        assert_eq!(none_ancestor_clicks.get(), 1);
+        assert_eq!(auto_child_clicks.get(), 1);
+        pointer_scroll(cx, window, point(px(50.), px(50.)));
+        assert_eq!(underlay_scrolls.get(), 1);
+        assert_eq!(none_ancestor_scrolls.get(), 1);
+        assert_eq!(auto_child_scrolls.get(), 1);
+
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_mouse_move(point(px(10.), px(10.)), cx)
+        })
+        .unwrap();
+        assert!(!none_ancestor_hovered.get());
+
+        focus_and_draw(cx, window, &focus);
+        key_down(cx, window, "enter");
+        assert_eq!(keyboard_events.get(), 1);
+    }
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,

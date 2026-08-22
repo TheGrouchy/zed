@@ -588,7 +588,7 @@ pub(crate) struct CursorStyleRequest {
 #[derive(Default, Eq, PartialEq)]
 pub(crate) struct HitTest {
     pub(crate) ids: SmallVec<[HitboxId; 8]>,
-    pub(crate) hover_hitbox_count: usize,
+    pub(crate) hover_ids: SmallVec<[HitboxId; 8]>,
 }
 
 /// A type of window control area that corresponds to the platform window.
@@ -650,13 +650,7 @@ impl HitboxId {
     }
 
     fn hit_test(self, window: &Window) -> bool {
-        let hit_test = &window.mouse_hit_test;
-        for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
-            if self == *id {
-                return true;
-            }
-        }
-        false
+        window.mouse_hit_test.hover_ids.contains(&self)
     }
 
     /// Checks if the hitbox with this ID contains the mouse and should handle scroll events.
@@ -755,6 +749,13 @@ impl Hitbox {
     pub fn should_handle_scroll(&self, window: &Window) -> bool {
         self.id.should_handle_scroll(window)
     }
+
+    /// Checks whether this hitbox is in the current pointer event path. Unlike
+    /// [`Self::is_hovered`], this is true for a `pointer-events: none`
+    /// ancestor when an explicitly re-enabled descendant is the target.
+    pub(crate) fn receives_pointer_event(&self, window: &Window) -> bool {
+        window.mouse_hit_test.ids.contains(&self.id)
+    }
 }
 
 /// How the hitbox affects mouse behavior.
@@ -814,6 +815,18 @@ pub enum HitboxBehavior {
     /// inconsistent UI where clicks and moves interact with elements that are not considered to
     /// be hovered.
     BlockMouseExceptScroll,
+
+    /// The hitbox is never itself a pointer target. It is included in the
+    /// event path only when a descendant with
+    /// [`HitboxBehavior::PointerEventsAuto`] is the target, matching CSS
+    /// `pointer-events: none` ancestor bubbling without activating `:hover`.
+    PointerEventsNone,
+
+    /// The hitbox participates in subtree-aware pointer targeting, matching
+    /// CSS `pointer-events: auto`. The topmost target and its element-path
+    /// ancestors receive pointer and wheel events; unrelated hitboxes behind
+    /// the target do not.
+    PointerEventsAuto,
 }
 
 /// An identifier for a tooltip.
@@ -858,6 +871,12 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+#[derive(Clone)]
+struct FrameHitbox {
+    hitbox: Hitbox,
+    element_path: Arc<[ElementId]>,
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -866,7 +885,7 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
-    pub(crate) hitboxes: Vec<Hitbox>,
+    hitboxes: Vec<FrameHitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -974,25 +993,79 @@ impl Frame {
     }
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
-        let mut set_hover_hitbox_count = false;
+        let contains = |entry: &FrameHitbox| {
+            entry
+                .hitbox
+                .bounds
+                .intersect(&entry.hitbox.content_mask.bounds)
+                .contains(&position)
+        };
+        let effective_pointer_events = |element_path: &[ElementId]| {
+            self.hitboxes
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| element_path.starts_with(entry.element_path.as_ref()))
+                .filter_map(|(paint_order, entry)| match entry.hitbox.behavior {
+                    HitboxBehavior::PointerEventsNone | HitboxBehavior::PointerEventsAuto => {
+                        Some((entry.element_path.len(), paint_order, entry.hitbox.behavior))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(depth, paint_order, _)| (*depth, *paint_order))
+                .map(|(_, _, behavior)| behavior)
+        };
+        let target = self
+            .hitboxes
+            .iter()
+            .rev()
+            .filter(|entry| contains(entry))
+            .find(|entry| {
+                effective_pointer_events(entry.element_path.as_ref())
+                    != Some(HitboxBehavior::PointerEventsNone)
+            });
+        let target_path = target.map(|entry| entry.element_path.clone());
+        let pointer_events_managed = target.is_some_and(|entry| {
+            effective_pointer_events(entry.element_path.as_ref())
+                == Some(HitboxBehavior::PointerEventsAuto)
+        });
+
+        let mut allow_hover = true;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
+        for entry in self.hitboxes.iter().rev() {
+            let hitbox = &entry.hitbox;
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
+                if pointer_events_managed {
+                    let Some(target_path) = target_path.as_ref() else {
+                        continue;
+                    };
+                    if !target_path.starts_with(entry.element_path.as_ref()) {
+                        continue;
+                    }
+                } else {
+                    if effective_pointer_events(entry.element_path.as_ref())
+                        == Some(HitboxBehavior::PointerEventsNone)
+                    {
+                        continue;
+                    }
+                    if matches!(
+                        hitbox.behavior,
+                        HitboxBehavior::PointerEventsNone | HitboxBehavior::PointerEventsAuto
+                    ) {
+                        continue;
+                    }
+                }
                 hit_test.ids.push(hitbox.id);
-                if !set_hover_hitbox_count
-                    && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
-                {
-                    hit_test.hover_hitbox_count = hit_test.ids.len();
-                    set_hover_hitbox_count = true;
+                if allow_hover && hitbox.behavior != HitboxBehavior::PointerEventsNone {
+                    hit_test.hover_ids.push(hitbox.id);
+                }
+                if hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll {
+                    allow_hover = false;
                 }
                 if hitbox.behavior == HitboxBehavior::BlockMouse {
                     break;
                 }
             }
-        }
-        if !set_hover_hitbox_count {
-            hit_test.hover_hitbox_count = hit_test.ids.len();
         }
         hit_test
     }
@@ -4674,7 +4747,10 @@ impl Window {
             content_mask,
             behavior,
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
+        self.next_frame.hitboxes.push(FrameHitbox {
+            hitbox: hitbox.clone(),
+            element_path: Arc::from(&*self.element_id_stack),
+        });
         hitbox
     }
 
@@ -6147,7 +6223,8 @@ impl Window {
                     .next_frame
                     .hitboxes
                     .iter()
-                    .find(|hitbox| hitbox.id == hitbox_id)
+                    .find(|entry| entry.hitbox.id == hitbox_id)
+                    .map(|entry| &entry.hitbox)
             {
                 self.paint_quad(crate::fill(hitbox.bounds, crate::rgba(0x61afef4d)));
             }
