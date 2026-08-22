@@ -4120,7 +4120,10 @@ impl Window {
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background,
-            border_color: quad.border_color.opacity(opacity),
+            border_colors: quad
+                .border_colors
+                .unwrap_or_else(|| Edges::all(quad.border_color))
+                .map(|color| color.opacity(opacity)),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
@@ -6735,6 +6738,9 @@ pub struct PaintQuad {
     pub border_widths: Edges<Pixels>,
     /// The color of the quad's borders.
     pub border_color: Hsla,
+    /// Optional per-edge border colors. These take precedence over
+    /// `border_color` when present.
+    pub border_colors: Option<Edges<Hsla>>,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
 }
@@ -6760,6 +6766,15 @@ impl PaintQuad {
     pub fn border_color(self, border_color: impl Into<Hsla>) -> Self {
         PaintQuad {
             border_color: border_color.into(),
+            border_colors: None,
+            ..self
+        }
+    }
+
+    /// Sets all four border colors independently.
+    pub fn border_colors(self, border_colors: Edges<Hsla>) -> Self {
+        PaintQuad {
+            border_colors: Some(border_colors),
             ..self
         }
     }
@@ -6788,6 +6803,7 @@ pub fn quad(
         background: background.into(),
         border_widths: border_widths.into(),
         border_color: border_color.into(),
+        border_colors: None,
         border_style,
     }
 }
@@ -6800,6 +6816,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         background: background.into(),
         border_widths: (0.).into(),
         border_color: transparent_black(),
+        border_colors: None,
         border_style: BorderStyle::default(),
     }
 }
@@ -6816,6 +6833,7 @@ pub fn outline(
         background: transparent_black().into(),
         border_widths: (1.).into(),
         border_color: border_color.into(),
+        border_colors: None,
         border_style,
     }
 }

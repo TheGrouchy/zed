@@ -553,10 +553,17 @@ struct Quad {
     bounds: Bounds,
     content_mask: Bounds,
     background: Background,
-    border_color: Hsla,
+    border_colors: HslaEdges,
     corner_radii: Corners,
     border_widths: Edges,
     fade: EdgeFadeParams,
+}
+
+struct HslaEdges {
+    top: Hsla,
+    right: Hsla,
+    bottom: Hsla,
+    left: Hsla,
 }
 @group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
 
@@ -588,7 +595,9 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_solid = gradient.solid;
     out.background_color0 = gradient.color0;
     out.background_color1 = gradient.color1;
-    out.border_color = hsla_to_rgba(quad.border_color);
+    // Retained as a flat varying for pipeline layout stability. The fragment
+    // shader selects the exact edge color from the quad storage record.
+    out.border_color = hsla_to_rgba(quad.border_colors.top);
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     return out;
@@ -723,7 +732,18 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     var color = background_color;
     if (border_sdf < antialias_threshold) {
-        var border_color = input.border_color;
+        let border_is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
+        var selected_border_color = select(
+            quad.border_colors.right,
+            quad.border_colors.left,
+            center_to_point.x < 0.0);
+        if (border_is_horizontal) {
+            selected_border_color = select(
+                quad.border_colors.bottom,
+                quad.border_colors.top,
+                center_to_point.y < 0.0);
+        }
+        var border_color = hsla_to_rgba(selected_border_color);
 
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {

@@ -493,13 +493,20 @@ float quarter_ellipse_sdf(float2 pt, float2 radii) {
 **
 */
 
+struct HslaEdges {
+    Hsla top;
+    Hsla right;
+    Hsla bottom;
+    Hsla left;
+};
+
 struct Quad {
     uint order;
     uint border_style;
     Bounds bounds;
     Bounds content_mask;
     Background background;
-    Hsla border_color;
+    HslaEdges border_colors;
     Corners corner_radii;
     Edges border_widths;
 };
@@ -537,7 +544,9 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_Insta
         quad.background.colors
     );
     float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
-    float4 border_color = hsla_to_rgba(quad.border_color);
+    // Retained as a flat varying for pipeline layout stability. The pixel
+    // shader selects the exact edge color from the quad storage record.
+    float4 border_color = hsla_to_rgba(quad.border_colors.top);
 
     QuadVertexOutput output;
     output.position = device_position;
@@ -660,7 +669,16 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
-        float4 border_color = input.border_color;
+        bool border_is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
+        Hsla selected_border_color = center_to_point.x < 0.0
+            ? quad.border_colors.left
+            : quad.border_colors.right;
+        if (border_is_horizontal) {
+            selected_border_color = center_to_point.y < 0.0
+                ? quad.border_colors.top
+                : quad.border_colors.bottom;
+        }
+        float4 border_color = hsla_to_rgba(selected_border_color);
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
             // Position along the perimeter in "dash space", where each dash

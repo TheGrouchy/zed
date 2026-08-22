@@ -372,6 +372,59 @@ pub fn border_style_methods(input: TokenStream) -> TokenStream {
             Self: Sized,
         {
             self.style().border_color = Some(border_color.into());
+            self.style().border_colors = None;
+            self
+        }
+
+        /// Sets the top border color independently of the other edges.
+        #visibility fn border_t_color<C>(mut self, border_color: C) -> Self
+        where
+            C: Into<gpui::Hsla>,
+            Self: Sized,
+        {
+            let uniform = self.style().border_color.unwrap_or_default();
+            self.style().border_colors
+                .get_or_insert_with(|| gpui::BorderColors::all(uniform))
+                .top = border_color.into();
+            self
+        }
+
+        /// Sets the right border color independently of the other edges.
+        #visibility fn border_r_color<C>(mut self, border_color: C) -> Self
+        where
+            C: Into<gpui::Hsla>,
+            Self: Sized,
+        {
+            let uniform = self.style().border_color.unwrap_or_default();
+            self.style().border_colors
+                .get_or_insert_with(|| gpui::BorderColors::all(uniform))
+                .right = border_color.into();
+            self
+        }
+
+        /// Sets the bottom border color independently of the other edges.
+        #visibility fn border_b_color<C>(mut self, border_color: C) -> Self
+        where
+            C: Into<gpui::Hsla>,
+            Self: Sized,
+        {
+            let uniform = self.style().border_color.unwrap_or_default();
+            self.style().border_colors
+                .get_or_insert_with(|| gpui::BorderColors::all(uniform))
+                .bottom = border_color.into();
+            self
+        }
+
+        /// Sets the left border color independently of the other edges.
+        #visibility fn border_l_color<C>(mut self, border_color: C) -> Self
+        where
+            C: Into<gpui::Hsla>,
+            Self: Sized,
+        {
+            let uniform = self.style().border_color.unwrap_or_default();
+            self.style().border_colors
+                .get_or_insert_with(|| gpui::BorderColors::all(uniform))
+                .left = border_color.into();
             self
         }
 

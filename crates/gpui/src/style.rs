@@ -174,6 +174,40 @@ pub struct GridTemplate {
     pub min_size: TemplateColumnMinSize,
 }
 
+/// Independent colors for the four CSS border edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct BorderColors {
+    /// Top edge color.
+    pub top: Hsla,
+    /// Right edge color.
+    pub right: Hsla,
+    /// Bottom edge color.
+    pub bottom: Hsla,
+    /// Left edge color.
+    pub left: Hsla,
+}
+
+impl BorderColors {
+    /// Creates a uniform four-edge color set.
+    pub fn all(color: Hsla) -> Self {
+        Self {
+            top: color,
+            right: color,
+            bottom: color,
+            left: color,
+        }
+    }
+
+    fn as_edges(self) -> Edges<Hsla> {
+        Edges {
+            top: self.top,
+            right: self.right,
+            bottom: self.bottom,
+            left: self.left,
+        }
+    }
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -276,6 +310,11 @@ pub struct Style {
 
     /// The border color of this element
     pub border_color: Option<Hsla>,
+
+    /// Per-edge border colors. When present these override `border_color` and
+    /// allow CSS longhands such as `border-top-color: transparent` to retain
+    /// their exact paint semantics.
+    pub border_colors: Option<BorderColors>,
 
     /// The border style of this element
     pub border_style: BorderStyle,
@@ -744,16 +783,20 @@ impl Style {
 
         if self.is_border_visible() {
             let border_widths = self.border_widths.to_pixels(rem_size);
-            let mut background = self.border_color.unwrap_or_default();
+            let border_colors = self.resolved_border_colors();
+            let mut background = border_colors.top;
             background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background,
+                    border_widths,
+                    self.border_color.unwrap_or_default(),
+                    self.border_style,
+                )
+                .border_colors(border_colors),
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -763,9 +806,15 @@ impl Style {
     }
 
     fn is_border_visible(&self) -> bool {
-        self.border_color
-            .is_some_and(|color| !color.is_transparent())
+        self.resolved_border_colors()
+            .any(|color| !color.is_transparent())
             && self.border_widths.any(|length| !length.is_zero())
+    }
+
+    fn resolved_border_colors(&self) -> Edges<Hsla> {
+        self.border_colors
+            .map(BorderColors::as_edges)
+            .unwrap_or_else(|| Edges::all(self.border_color.unwrap_or_default()))
     }
 }
 
@@ -804,6 +853,7 @@ impl Default for Style {
             flex_basis: Length::Auto,
             background: None,
             border_color: None,
+            border_colors: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
@@ -1526,5 +1576,31 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+
+    #[test]
+    fn per_edge_border_colors_preserve_longhand_overrides() {
+        let refinement = StyleRefinement::default()
+            .border_color(red())
+            .border_t_color(Hsla::default())
+            .border_r_color(green());
+        let mut style = Style::default();
+        style.refine(&refinement);
+
+        assert_eq!(
+            style.resolved_border_colors(),
+            Edges {
+                top: Hsla::default(),
+                right: green(),
+                bottom: red(),
+                left: red(),
+            }
+        );
+
+        let shorthand_last = StyleRefinement::default()
+            .border_t_color(red())
+            .border_color(blue());
+        assert_eq!(shorthand_last.border_color, Some(blue()));
+        assert_eq!(shorthand_last.border_colors, None);
     }
 }

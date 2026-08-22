@@ -78,7 +78,9 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       to_device_position(unit_vertex, quad.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
                                                  quad.content_mask.bounds);
-  float4 border_color = hsla_to_rgba(quad.border_color);
+  // Retained as a flat varying for pipeline layout stability. The fragment
+  // shader selects the exact edge color from the quad storage record.
+  float4 border_color = hsla_to_rgba(quad.border_colors.top);
 
   GradientColor gradient = prepare_fill_color(
     quad.background.tag,
@@ -216,7 +218,16 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   float4 color = background_color;
   if (border_sdf < antialias_threshold) {
-    float4 border_color = input.border_color;
+    bool border_is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
+    Hsla selected_border_color = center_to_point.x < 0.0
+        ? quad.border_colors.left
+        : quad.border_colors.right;
+    if (border_is_horizontal) {
+      selected_border_color = center_to_point.y < 0.0
+          ? quad.border_colors.top
+          : quad.border_colors.bottom;
+    }
+    float4 border_color = hsla_to_rgba(selected_border_color);
     border_color.a *= edge_fade;
 
     // Dashed border logic when border_style == 1
