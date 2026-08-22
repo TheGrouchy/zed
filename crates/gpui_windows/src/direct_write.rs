@@ -503,17 +503,44 @@ impl DirectWriteState {
         };
         let fontset = unsafe { collection.GetFontSet().log_err()? };
         let font_family_h = HSTRING::from(family.as_str());
-        let mut font = unsafe {
-            fontset
-                .GetMatchingFonts(
-                    &font_family_h,
-                    font_weight_to_dwrite(weight),
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    font_style_to_dwrite(style),
-                )
-                .log_err()?
+        // A CSS family may intentionally name a face whose typographic family
+        // is shared with another face (for example a separately supplied
+        // outline face). Resolve an exact full/PostScript name before family
+        // matching so DirectWrite cannot silently return the family's regular
+        // face instead.
+        let full_name_property = DWRITE_FONT_PROPERTY {
+            propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+            propertyValue: PCWSTR(font_family_h.as_ptr()),
+            localeName: PCWSTR::null(),
         };
-        if unsafe { font.GetFontCount() } > 0
+        let mut font = unsafe { fontset.GetMatchingFonts2(&[full_name_property]).log_err()? };
+        if unsafe { font.GetFontCount() } == 0 {
+            let postscript_property = DWRITE_FONT_PROPERTY {
+                propertyId: DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
+                propertyValue: PCWSTR(font_family_h.as_ptr()),
+                localeName: PCWSTR::null(),
+            };
+            font = unsafe {
+                fontset
+                    .GetMatchingFonts2(&[postscript_property])
+                    .log_err()?
+            };
+        }
+        let exact_face_selected = unsafe { font.GetFontCount() } > 0;
+        if !exact_face_selected {
+            font = unsafe {
+                fontset
+                    .GetMatchingFonts(
+                        &font_family_h,
+                        font_weight_to_dwrite(weight),
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        font_style_to_dwrite(style),
+                    )
+                    .log_err()?
+            };
+        }
+        if !exact_face_selected
+            && unsafe { font.GetFontCount() } > 0
             && let Ok(fontset_with_axes) = font.cast::<IDWriteFontSet1>()
         {
             let weight_axis = DWRITE_FONT_AXIS_VALUE {
@@ -529,26 +556,6 @@ impl DirectWriteState {
             {
                 font = instanced;
             }
-        }
-        if unsafe { font.GetFontCount() } == 0 {
-            // DirectWrite groups typographic subfamilies such as the locked
-            // `Sudo Outlined` face under one family (`Sudo`). Preserve GPUI's
-            // family string as an exact full-name selector before falling
-            // back to the application-wide font stack.
-            let property = DWRITE_FONT_PROPERTY {
-                propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
-                propertyValue: PCWSTR(font_family_h.as_ptr()),
-                localeName: PCWSTR::null(),
-            };
-            font = unsafe { fontset.GetMatchingFonts2(&[property]).log_err()? };
-        }
-        if unsafe { font.GetFontCount() } == 0 {
-            let property = DWRITE_FONT_PROPERTY {
-                propertyId: DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
-                propertyValue: PCWSTR(font_family_h.as_ptr()),
-                localeName: PCWSTR::null(),
-            };
-            font = unsafe { fontset.GetMatchingFonts2(&[property]).log_err()? };
         }
         let total_number = unsafe { font.GetFontCount() };
         for index in 0..total_number {
