@@ -3,6 +3,7 @@ mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
+mod white_space;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
@@ -11,6 +12,7 @@ pub use line_layout::*;
 pub use line_wrapper::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+pub use white_space::*;
 
 use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
@@ -524,6 +526,27 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_white_space(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            crate::WhiteSpace::Legacy,
+        )
+    }
+
+    /// Shape processed CSS text while retaining its whitespace mode in wrap
+    /// computation and cache identity.
+    pub fn shape_text_with_white_space(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        white_space: crate::WhiteSpace,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -531,7 +554,7 @@ impl WindowTextSystem {
         let mut max_wrap_lines = line_clamp;
         let mut wrapped_lines = 0;
 
-        let mut process_line = |line_text: SharedString, line_start, line_end| {
+        let mut process_line = |line_text: SharedString, line_start, line_end| -> Result<()> {
             font_runs.clear();
 
             let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(32);
@@ -592,7 +615,8 @@ impl WindowTextSystem {
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
-            );
+                white_space,
+            )?;
             wrapped_lines += layout.wrap_boundaries.len();
 
             lines.push(WrappedLine {
@@ -608,6 +632,7 @@ impl WindowTextSystem {
                     runs.next();
                 }
             }
+            Ok(())
         };
 
         let mut split_lines = text.split('\n');
@@ -621,24 +646,24 @@ impl WindowTextSystem {
                 SharedString::new(first_line),
                 line_start,
                 line_start + first_line.len(),
-            );
+            )?;
             line_start += first_line.len() + '\n'.len_utf8();
             process_line(
                 SharedString::new(second_line),
                 line_start,
                 line_start + second_line.len(),
-            );
+            )?;
             for line_text in split_lines {
                 line_start += line_text.len() + '\n'.len_utf8();
                 process_line(
                     SharedString::new(line_text),
                     line_start,
                     line_start + line_text.len(),
-                );
+                )?;
             }
         } else {
             let end = text.len();
-            process_line(text, 0, end);
+            process_line(text, 0, end)?;
         }
 
         self.font_runs_pool.lock().push(font_runs);

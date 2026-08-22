@@ -84,6 +84,18 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets whitespace to CSS `pre-line` processing.
+    fn whitespace_pre_line(mut self) -> Self {
+        self.text_style().white_space = Some(WhiteSpace::PreLine);
+        self
+    }
+
+    /// Sets whitespace to CSS `pre-wrap` processing.
+    fn whitespace_pre_wrap(mut self) -> Self {
+        self.text_style().white_space = Some(WhiteSpace::PreWrap);
+        self
+    }
+
     /// Sets the truncate overflowing text with an ellipsis (…) at the end if needed.
     /// [Docs](https://tailwindcss.com/docs/text-overflow#ellipsis)
     fn text_ellipsis(mut self) -> Self {

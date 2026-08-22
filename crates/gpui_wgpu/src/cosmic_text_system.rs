@@ -922,6 +922,8 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{TextRun, TextSystem, WhiteSpace, WindowTextSystem, prepare_whitespace};
+    use std::sync::Arc;
 
     const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
@@ -952,6 +954,48 @@ mod tests {
         assert!(
             (actual - expected).abs() < Pixels::from(0.01),
             "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn css_whitespace_uses_exact_shared_tab_stops_and_wraps_in_cosmic_text() {
+        let platform = Arc::new(letter_spacing_system());
+        let text_system = Arc::new(TextSystem::new(platform));
+        let window_text_system = WindowTextSystem::new(text_system);
+        let source = "a\tb\t\tc";
+        let source_run = TextRun {
+            len: source.len(),
+            font: gpui::font("Lilex"),
+            ..Default::default()
+        };
+        let prepared =
+            prepare_whitespace(source.into(), vec![source_run], WhiteSpace::PreWrap).unwrap();
+        let space_run = TextRun {
+            len: 1,
+            font: gpui::font("Lilex"),
+            ..Default::default()
+        };
+        let space = window_text_system
+            .layout_line(" ", Pixels::from(13.5), &[space_run], None)
+            .width;
+        let lines = window_text_system
+            .shape_text_with_white_space(
+                prepared.text,
+                Pixels::from(13.5),
+                &prepared.runs,
+                Some(space * 12),
+                None,
+                WhiteSpace::PreWrap,
+            )
+            .unwrap();
+        let layout = &lines[0].unwrapped_layout;
+        assert_close(layout.x_for_index(2), space * 8);
+        assert_close(layout.x_for_index(5), space * 24);
+        assert_eq!(lines[0].wrap_boundaries().len(), 1);
+        let boundary = lines[0].wrap_boundaries()[0];
+        assert_eq!(
+            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index,
+            5
         );
     }
 

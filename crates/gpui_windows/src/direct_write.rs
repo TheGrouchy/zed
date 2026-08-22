@@ -2159,10 +2159,14 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::sync::Arc;
 
     use crate::DirectXDevices;
     use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
-    use gpui::{FontFallbacks, FontRun, Pixels, PlatformTextSystem, font};
+    use gpui::{
+        FontFallbacks, FontRun, Pixels, PlatformTextSystem, TextRun, TextSystem, WhiteSpace,
+        WindowTextSystem, font, prepare_whitespace,
+    };
 
     const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
 
@@ -2247,6 +2251,48 @@ mod tests {
         assert!(
             (actual - expected).abs() < Pixels::from(0.02),
             "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn css_whitespace_uses_exact_shared_tab_stops_and_wraps_on_direct_write() {
+        let platform = Arc::new(letter_spacing_system());
+        let text_system = Arc::new(TextSystem::new(platform));
+        let window_text_system = WindowTextSystem::new(text_system);
+        let source = "a\tb\t\tc";
+        let source_run = TextRun {
+            len: source.len(),
+            font: font("Lilex"),
+            ..Default::default()
+        };
+        let prepared =
+            prepare_whitespace(source.into(), vec![source_run], WhiteSpace::PreWrap).unwrap();
+        let space_run = TextRun {
+            len: 1,
+            font: font("Lilex"),
+            ..Default::default()
+        };
+        let space = window_text_system
+            .layout_line(" ", Pixels::from(13.5), &[space_run], None)
+            .width;
+        let lines = window_text_system
+            .shape_text_with_white_space(
+                prepared.text,
+                Pixels::from(13.5),
+                &prepared.runs,
+                Some(space * 12),
+                None,
+                WhiteSpace::PreWrap,
+            )
+            .unwrap();
+        let layout = &lines[0].unwrapped_layout;
+        assert_close(layout.x_for_index(2), space * 8);
+        assert_close(layout.x_for_index(5), space * 24);
+        assert_eq!(lines[0].wrap_boundaries().len(), 1);
+        let boundary = lines[0].wrap_boundaries()[0];
+        assert_eq!(
+            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index,
+            5
         );
     }
 

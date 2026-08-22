@@ -1,9 +1,9 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PreparedWhitespace, SharedString,
+    Size, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, Window, WrappedLine,
+    WrappedLineLayout, prepare_whitespace, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -644,11 +644,23 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
+        let prepared = match prepare_whitespace(text, runs, text_style.white_space) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                log::error!("CSS whitespace processing failed closed: {error}");
+                PreparedWhitespace {
+                    text: SharedString::new_static(""),
+                    runs: Vec::new(),
+                }
+            }
+        };
+        let text = prepared.text;
+        let runs = prepared.runs;
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
-                let wrap_width = if text_style.white_space == WhiteSpace::Normal {
+                let wrap_width = if text_style.white_space.permits_soft_wrap() {
                     known_dimensions.width.or(match available_space.width {
                         crate::AvailableSpace::Definite(x) => Some(x),
                         _ => None,
@@ -708,7 +720,14 @@ impl TextLayout {
                         )
                     } else if let Some(unclipped) = window
                         .text_system()
-                        .shape_text(text.clone(), font_size, &runs, None, None)
+                        .shape_text_with_white_space(
+                            text.clone(),
+                            font_size,
+                            &runs,
+                            None,
+                            None,
+                            text_style.white_space,
+                        )
                         .log_err()
                         && unclipped
                             .iter()
@@ -737,12 +756,13 @@ impl TextLayout {
 
                 let Some(lines) = window
                     .text_system()
-                    .shape_text(
+                    .shape_text_with_white_space(
                         text,
                         font_size,
                         &runs,
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
+                        text_style.white_space,
                     )
                     .log_err()
                 else {

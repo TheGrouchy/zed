@@ -1,4 +1,8 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    CSS_TAB_SIZE, FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size,
+    WhiteSpace, point, px,
+};
+use anyhow::{Result, anyhow, ensure};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -12,7 +16,7 @@ use std::{
 use super::LineWrapper;
 
 /// A laid out and styled line of text
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct LineLayout {
     /// The font size for this line
     pub font_size: Pixels,
@@ -26,6 +30,71 @@ pub struct LineLayout {
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+}
+
+/// Apply CSS numeric `tab-size: 8` to a shaped, left-to-right line.
+///
+/// Platform shapers disagree on the advance assigned to U+0009 (Cosmic Text
+/// uses four spaces, while DirectWrite and CoreText have their own defaults).
+/// CSS instead advances a preserved tab to the next multiple of eight shaped
+/// U+0020 advances from the line origin. Doing this after shaping keeps the
+/// calculation identical on every renderer and also works for proportional
+/// fonts.
+fn apply_css_tab_stops(
+    layout: &mut LineLayout,
+    text: &str,
+    font_runs: &[FontRun],
+    mut space_advance: impl FnMut(FontRun) -> Result<Pixels>,
+) -> Result<()> {
+    if !text.contains('\t') {
+        return Ok(());
+    }
+
+    let run_coverage = font_runs.iter().map(|run| run.len).sum::<usize>();
+    ensure!(
+        run_coverage == text.len(),
+        "font runs cover {run_coverage} bytes but tabbed line contains {} bytes",
+        text.len()
+    );
+
+    let mut run_ix = 0usize;
+    let mut run_end = font_runs.first().map_or(0, |run| run.len);
+    for (tab_ix, _) in text.match_indices('\t') {
+        while tab_ix >= run_end && run_ix + 1 < font_runs.len() {
+            run_ix += 1;
+            run_end += font_runs[run_ix].len;
+        }
+        let tab_run = font_runs
+            .get(run_ix)
+            .ok_or_else(|| anyhow!("preserved tab at byte {tab_ix} has no font run"))?;
+
+        let tab_start = layout.x_for_index(tab_ix);
+        let platform_tab_end = layout.x_for_index(tab_ix + '\t'.len_utf8());
+        let interval = space_advance(FontRun {
+            len: 1,
+            font_id: tab_run.font_id,
+            letter_spacing: tab_run.letter_spacing,
+        })? * CSS_TAB_SIZE;
+        ensure!(
+            interval > Pixels::ZERO,
+            "font {:?} produced a non-positive CSS tab interval",
+            tab_run.font_id
+        );
+
+        // A tab at an exact stop advances by a complete interval.
+        let next_stop = interval * ((tab_start / interval).floor() + 1.0);
+        let shift = next_stop - platform_tab_end;
+        for run in &mut layout.runs {
+            for glyph in &mut run.glyphs {
+                if glyph.index > tab_ix {
+                    glyph.position.x += shift;
+                }
+            }
+        }
+        layout.width += shift;
+    }
+
+    Ok(())
 }
 
 /// A run of text that has been shaped .
@@ -130,6 +199,7 @@ impl LineLayout {
         text: &str,
         wrap_width: Pixels,
         max_lines: Option<usize>,
+        white_space: WhiteSpace,
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut boundaries = SmallVec::new();
         let mut first_non_whitespace_ix = None;
@@ -162,10 +232,14 @@ impl LineLayout {
                 continue;
             }
 
+            let is_layout_space = ch == ' ' || (white_space == WhiteSpace::PreWrap && ch == '\t');
+            let previous_is_layout_space =
+                prev_ch == ' ' || (white_space == WhiteSpace::PreWrap && prev_ch == '\t');
+
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
             if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
+                if previous_is_layout_space && first_non_whitespace_ix.is_some() {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
                 }
@@ -175,7 +249,7 @@ impl LineLayout {
                 // char directly after a word char is closing punctuation
                 // (`powerless."`, `word)`, `done!`) — breaking there orphans
                 // the punctuation at the start of the next line.
-                if ch != ' '
+                if !is_layout_space
                     && !LineWrapper::is_word_char(prev_ch)
                     && first_non_whitespace_ix.is_some()
                 {
@@ -184,14 +258,16 @@ impl LineLayout {
                 }
             }
 
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
+            if !is_layout_space && first_non_whitespace_ix.is_none() {
                 first_non_whitespace_ix = Some(boundary);
             }
 
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            let preserved_space_hangs =
+                white_space == WhiteSpace::PreWrap && matches!(ch, ' ' | '\t');
+            if !preserved_space_hangs && width > wrap_width && boundary > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -524,7 +600,8 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
-    ) -> Arc<WrappedLineLayout>
+        white_space: WhiteSpace,
+    ) -> Result<Arc<WrappedLineLayout>>
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
@@ -535,11 +612,12 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            white_space,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
         if let Some(layout) = current_frame.wrapped_lines.get(key) {
-            return layout.clone();
+            return Ok(layout.clone());
         }
 
         let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
@@ -549,13 +627,39 @@ impl LineLayoutCache {
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
             current_frame.used_wrapped_lines.push(key);
-            layout
+            Ok(layout)
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let has_css_tabs = white_space == WhiteSpace::PreWrap && text.contains('\t');
+            // Shape tabs as ordinary spaces first so every platform produces
+            // a stable, non-rendering glyph at the tab's logical byte index.
+            // The exact CSS advance is installed below.
+            let unwrapped_layout = if has_css_tabs {
+                let shaping_text: SharedString = text.replace('\t', " ").into();
+                self.layout_line::<&SharedString>(&shaping_text, font_size, runs, None)
+            } else {
+                self.layout_line::<&SharedString>(&text, font_size, runs, None)
+            };
+            let unwrapped_layout = if has_css_tabs {
+                let mut css_layout = (*unwrapped_layout).clone();
+                apply_css_tab_stops(&mut css_layout, &text, runs, |space_run| {
+                    Ok(self
+                        .platform_text_system
+                        .layout_line(" ", font_size, &[space_run])
+                        .width)
+                })?;
+                Arc::new(css_layout)
+            } else {
+                unwrapped_layout
+            };
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+                unwrapped_layout.compute_wrap_boundaries(
+                    text.as_ref(),
+                    wrap_width,
+                    max_lines,
+                    white_space,
+                )
             } else {
                 SmallVec::new()
             };
@@ -570,6 +674,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                white_space,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -578,7 +683,7 @@ impl LineLayoutCache {
                 .insert(key.clone(), layout.clone());
             current_frame.used_wrapped_lines.push(key);
 
-            layout
+            Ok(layout)
         }
     }
 
@@ -599,6 +704,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            white_space: WhiteSpace::Legacy,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -627,6 +733,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                white_space: WhiteSpace::Legacy,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -658,6 +765,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            white_space: WhiteSpace::Legacy,
         };
 
         let current_frame = self.current_frame.read();
@@ -669,6 +777,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                white_space: key.white_space,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -683,6 +792,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                white_space: key.white_space,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -715,6 +825,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            white_space: WhiteSpace::Legacy,
         };
 
         // Fast path: already cached (no allocation).
@@ -727,6 +838,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                white_space: key.white_space,
             } == key_ref
         }) {
             return layout.clone();
@@ -748,6 +860,7 @@ impl LineLayoutCache {
                     runs: key.runs.as_slice(),
                     wrap_width: key.wrap_width,
                     force_width: key.force_width,
+                    white_space: key.white_space,
                 } == key_ref
             })
             .cloned()
@@ -777,6 +890,7 @@ impl LineLayoutCache {
             runs: SmallVec::from(runs),
             wrap_width: None,
             force_width,
+            white_space: WhiteSpace::Legacy,
         });
         let layout = Arc::new(layout);
         current_frame
@@ -837,6 +951,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    white_space: WhiteSpace,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -846,6 +961,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    white_space: WhiteSpace,
 }
 
 #[derive(Clone, Debug)]
@@ -856,6 +972,7 @@ struct HashedCacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    white_space: WhiteSpace,
 }
 
 #[derive(Copy, Clone)]
@@ -866,6 +983,7 @@ struct HashedCacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    white_space: WhiteSpace,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -882,6 +1000,7 @@ impl PartialEq for HashedCacheKey {
             && self.runs.as_slice() == other.runs.as_slice()
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.white_space == other.white_space
     }
 }
 
@@ -895,6 +1014,7 @@ impl Hash for HashedCacheKey {
         self.runs.as_slice().hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.white_space.hash(state);
     }
 }
 
@@ -906,6 +1026,7 @@ impl PartialEq for HashedCacheKeyRef<'_> {
             && self.runs == other.runs
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.white_space == other.white_space
     }
 }
 
@@ -919,6 +1040,7 @@ impl Hash for HashedCacheKeyRef<'_> {
         self.runs.hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.white_space.hash(state);
     }
 }
 
@@ -938,6 +1060,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            white_space: self.white_space,
         }
     }
 }
@@ -1015,7 +1138,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut layout = make_layout(glyphs);
         layout.width = px(80.);
-        let boundaries = layout.compute_wrap_boundaries(text, px(72.), None);
+        let boundaries = layout.compute_wrap_boundaries(text, px(72.), None, WhiteSpace::Legacy);
         assert_eq!(
             boundaries.as_slice(),
             &[WrapBoundary {
@@ -1023,6 +1146,128 @@ mod tests {
                 glyph_ix: 4
             }]
         );
+    }
+
+    #[test]
+    fn css_tabs_use_pixel_stops_for_proportional_text() {
+        let text = "W\tb\t\tc";
+        let mut layout = LineLayout {
+            font_size: px(13.5),
+            width: px(36.),
+            ascent: px(10.),
+            descent: px(3.),
+            runs: vec![ShapedRun {
+                font_id: FontId(7),
+                glyphs: vec![
+                    glyph_at(0., 0),
+                    glyph_at(12., 1),
+                    glyph_at(16., 2),
+                    glyph_at(22., 3),
+                    glyph_at(26., 4),
+                    glyph_at(30., 5),
+                ],
+            }],
+            len: text.len(),
+        };
+        let font_runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(7),
+            letter_spacing: Pixels::ZERO,
+        }];
+
+        apply_css_tab_stops(&mut layout, text, &font_runs, |_| Ok(px(5.))).unwrap();
+
+        assert_eq!(
+            glyph_x_positions(&layout),
+            vec![0., 12., 40., 46., 80., 120.]
+        );
+        assert_eq!(layout.width, px(126.));
+    }
+
+    #[test]
+    fn pre_wrap_tabs_and_spaces_hang_before_the_following_word_wraps() {
+        let text = "a\tb\t\tc";
+        let mut layout = LineLayout {
+            font_size: px(13.5),
+            width: px(48.),
+            ascent: px(10.),
+            descent: px(3.),
+            runs: vec![ShapedRun {
+                font_id: FontId(1),
+                glyphs: vec![
+                    glyph_at(0., 0),
+                    glyph_at(8., 1),
+                    glyph_at(12., 2),
+                    glyph_at(20., 3),
+                    glyph_at(24., 4),
+                    glyph_at(40., 5),
+                ],
+            }],
+            len: text.len(),
+        };
+        let font_runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(1),
+            letter_spacing: Pixels::ZERO,
+        }];
+        apply_css_tab_stops(&mut layout, text, &font_runs, |_| Ok(px(8.))).unwrap();
+
+        let boundaries = layout.compute_wrap_boundaries(text, px(97.25), None, WhiteSpace::PreWrap);
+        assert_eq!(
+            boundaries.as_slice(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn pre_wrap_trailing_spaces_hang_without_creating_an_empty_line() {
+        let text = "word   ";
+        let glyphs = (0..text.len())
+            .map(|index| glyph_at(index as f32 * 8., index))
+            .collect::<Vec<_>>();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(text.len() as f32 * 8.);
+        layout.len = text.len();
+
+        let boundaries = layout.compute_wrap_boundaries(text, px(32.), None, WhiteSpace::PreWrap);
+        assert!(boundaries.is_empty());
+
+        let wrapped = WrappedLineLayout {
+            unwrapped_layout: Arc::new(layout),
+            wrap_boundaries: boundaries,
+            wrap_width: Some(px(32.)),
+        };
+        assert_eq!(wrapped.width(), px(32.));
+        assert_eq!(wrapped.size(px(18.)).height, px(18.));
+    }
+
+    #[test]
+    fn css_tab_layout_fails_closed_without_exact_run_or_space_metrics() {
+        let text = "a\tb";
+        let mut layout = LineLayout {
+            width: px(12.),
+            runs: vec![ShapedRun {
+                font_id: FontId(1),
+                glyphs: vec![glyph_at(0., 0), glyph_at(4., 1), glyph_at(8., 2)],
+            }],
+            len: text.len(),
+            ..Default::default()
+        };
+        let short_run = [FontRun {
+            len: 2,
+            font_id: FontId(1),
+            letter_spacing: Pixels::ZERO,
+        }];
+        assert!(apply_css_tab_stops(&mut layout, text, &short_run, |_| Ok(px(4.))).is_err());
+
+        let full_run = [FontRun {
+            len: text.len(),
+            ..short_run[0]
+        }];
+        assert!(apply_css_tab_stops(&mut layout, text, &full_run, |_| Ok(Pixels::ZERO)).is_err());
     }
 
     #[test]

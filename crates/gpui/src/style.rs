@@ -428,13 +428,33 @@ impl BoxShadow {
 }
 
 /// How to handle whitespace in text
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WhiteSpace {
-    /// Normal line wrapping when text overflows the width of the element
+    /// GPUI's historical behavior: preserve source bytes while allowing soft
+    /// wrapping. This remains the default so existing callers do not silently
+    /// acquire CSS whitespace collapsing.
     #[default]
+    Legacy,
+    /// Normal line wrapping when text overflows the width of the element
     Normal,
     /// No line wrapping, text will overflow the width of the element
     Nowrap,
+    /// Collapse spaces while preserving segment breaks and allowing wrapping.
+    PreLine,
+    /// Preserve spaces and segment breaks while allowing wrapping.
+    PreWrap,
+}
+
+impl WhiteSpace {
+    /// Whether this mode permits soft line wrapping.
+    pub fn permits_soft_wrap(self) -> bool {
+        !matches!(self, Self::Nowrap)
+    }
+
+    /// Whether this mode opts into CSS whitespace processing.
+    pub fn uses_css_processing(self) -> bool {
+        !matches!(self, Self::Legacy)
+    }
 }
 
 /// How to truncate text that overflows the width of the element
@@ -536,7 +556,7 @@ impl Default for TextStyle {
             background_color: None,
             underline: None,
             strikethrough: None,
-            white_space: WhiteSpace::Normal,
+            white_space: WhiteSpace::Legacy,
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,

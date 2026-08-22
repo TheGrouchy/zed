@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; }
+  .case {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 97.25px;
+    font-family: "Courier New", monospace;
+    font-size: 13.5px;
+    line-height: 18.25px;
+    tab-size: 8;
+  }
+</style>
+<div id="host"></div>
+<script id="result" type="application/json"></script>
+<script>
+  const declarations = [
+    ["styles.css:383", "nowrap"], ["styles.css:675", "nowrap"],
+    ["styles.css:677", "nowrap"], ["styles.css:830", "nowrap"],
+    ["styles.css:994", "pre-wrap"], ["styles.css:1104", "nowrap"],
+    ["v2/routes.css:41", "nowrap"], ["v2/routes.css:42", "nowrap"],
+    ["v2/routes.css:149", "pre-wrap"], ["v2/routes.css:348", "nowrap"],
+    ["v2/agentic.css:67", "nowrap"], ["v2/agentic.css:131", "nowrap"],
+    ["v2/agentic.css:195", "nowrap"], ["v2/agentic.css:325", "pre-line"],
+    ["v2/agentic.css:337", "nowrap"], ["v2/agentic.css:365", "nowrap"],
+    ["v2/agentic.css:371", "nowrap"], ["v2/agentic.css:479", "nowrap"],
+    ["v2/agentic.css:623", "nowrap"], ["v2/agentic.css:640", "nowrap"],
+    ["v2/agentic.css:667", "nowrap"], ["v2/agentic.css:979", "normal"],
+    ["v2/agentic.css:1016", "normal"], ["v2/skin-soft.css:249", "nowrap"],
+    ["v2/skin-soft.css:275", "nowrap"], ["v2/skin-soft.css:591", "nowrap"],
+  ];
+  const adversarial = [
+    ["segmentBreaks", "  A \r\n  B\r C\nD\f E  "],
+    ["tabs", "a\tb\t\tc"],
+    ["trailing", "lead  middle   tail   "],
+    ["wrapping", "alpha  beta gamma delta epsilon"],
+  ];
+
+  function round(value) { return Math.round(value * 1024) / 1024; }
+  function measure(mode, name, source) {
+    const node = document.createElement("div");
+    node.className = "case";
+    node.style.whiteSpace = mode;
+    node.textContent = source;
+    document.getElementById("host").appendChild(node);
+    const box = node.getBoundingClientRect();
+    const range = document.createRange();
+    const characters = [];
+    for (let index = 0; index < source.length; index++) {
+      range.setStart(node.firstChild, index);
+      range.setEnd(node.firstChild, index + 1);
+      const rects = Array.from(range.getClientRects()).map(rect => ({
+        x: round(rect.x - box.x), y: round(rect.y - box.y),
+        width: round(rect.width), height: round(rect.height),
+      }));
+      characters.push(rects);
+    }
+    const lineTops = Array.from(new Set(characters.flat().map(rect => rect.y))).sort((a, b) => a - b);
+    const result = {
+      name, mode, source, computedMode: getComputedStyle(node).whiteSpace,
+      innerText: node.innerText,
+      width: round(box.width), height: round(box.height),
+      scrollWidth: node.scrollWidth, scrollHeight: node.scrollHeight,
+      lineTops, characters,
+    };
+    node.remove();
+    return result;
+  }
+
+  const declarationCases = declarations.map(([source, mode], index) =>
+    measure(mode, `declaration-${index + 1}`, `  alpha \t beta\r\n gamma  `));
+  const adversarialCases = [];
+  for (const mode of ["normal", "nowrap", "pre-line", "pre-wrap"])
+    for (const [name, source] of adversarial)
+      adversarialCases.push(measure(mode, name, source));
+  document.getElementById("result").textContent = JSON.stringify({
+    devicePixelRatio, declarations, declarationCases, adversarialCases,
+  });
+</script>
