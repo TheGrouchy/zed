@@ -504,6 +504,14 @@ impl DirectWriteState {
             };
             font = unsafe { fontset.GetMatchingFonts2(&[property]).log_err()? };
         }
+        if unsafe { font.GetFontCount() } == 0 {
+            let property = DWRITE_FONT_PROPERTY {
+                propertyId: DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
+                propertyValue: PCWSTR(font_family_h.as_ptr()),
+                localeName: PCWSTR::null(),
+            };
+            font = unsafe { fontset.GetMatchingFonts2(&[property]).log_err()? };
+        }
         let total_number = unsafe { font.GetFontCount() };
         for index in 0..total_number {
             let res = maybe!({
@@ -1987,6 +1995,7 @@ mod tests {
         let system = letter_spacing_system();
         assert!(system.all_font_names().iter().any(|name| name == "Lilex"));
         system.font_id(&font("Lilex Regular")).unwrap();
+        system.font_id(&font("Lilex-Regular")).unwrap();
     }
 
     #[test]
