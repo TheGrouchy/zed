@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body {
+    width: 256px;
+    height: 64px;
+    margin: 0;
+    overflow: hidden;
+    background: transparent;
+  }
+  .glyph {
+    position: absolute;
+    top: 0;
+    width: 128px;
+    height: 64px;
+    color: rgba(255, 255, 255, .8);
+    font: 400 48px/64px Arial, sans-serif;
+  }
+  #unmasked-glyph {
+    left: 0;
+  }
+  #masked-glyph {
+    left: 128px;
+    -webkit-mask-image: linear-gradient(90deg, transparent 0%, black 100%);
+    mask-image: linear-gradient(90deg, transparent 0%, black 100%);
+  }
+</style>
+<div class="glyph" id="unmasked-glyph">H</div>
+<div class="glyph" id="masked-glyph">H</div>

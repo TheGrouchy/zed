@@ -1,0 +1,33 @@
+{
+  "oracle": "Chromium headless transparent PNG",
+  "chromiumVersion": "151.0.7922.170",
+  "deviceScaleFactor": 1,
+  "viewport": [256, 64],
+  "localMaskWidth": 128,
+  "text": "H",
+  "font": "400 48px/64px Arial, sans-serif",
+  "textAlpha": 0.8,
+  "mask": "linear-gradient(90deg, transparent 0%, black 100%)",
+  "pngSha256": "A1E5FE02DEBB5F913D0545C37C3AED4A489BC9572DB4EF2FAC3928BB6026E468",
+  "alphaSha256": "4849635107D30EF2995AD3EEAC345042F4A6ADEC108F471E4E3BEFF52BDEDCEB",
+  "unmaskedAlphaSha256": "50A95EAD07662F6A0413D6DD8CC330BEA00AEA707E7904572D20457D286ECD99",
+  "maskedAlphaSha256": "D836FC673075FD1F1970250CDEBAA5C4257B2017250A7C3B2D44B2C545C157E4",
+  "unmaskedNonzeroPixels": 519,
+  "maskedNonzeroPixels": 519,
+  "unmaskedAlphaSum": 88334,
+  "maskedAlphaSum": 12120,
+  "samples": [
+    [5, 13, 204, 9],
+    [29, 16, 204, 47],
+    [28, 20, 204, 46],
+    [27, 24, 204, 44],
+    [13, 27, 204, 22],
+    [11, 28, 204, 18],
+    [9, 29, 204, 15],
+    [7, 30, 204, 12],
+    [5, 31, 204, 9],
+    [29, 34, 204, 47],
+    [28, 38, 204, 46],
+    [27, 42, 204, 44]
+  ]
+}

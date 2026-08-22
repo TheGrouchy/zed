@@ -4339,7 +4339,12 @@ impl Window {
             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+        let subpixel_rendering = use_subpixel_glyph_rasterization(
+            self.should_use_subpixel_rendering(font_id, font_size),
+            self.next_frame
+                .scene
+                .has_active_linear_gradient_mask_group(),
+        );
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
             font_id,
@@ -4427,6 +4432,14 @@ impl Window {
         font_size: Pixels,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+
+        // Polychrome glyph coverage cannot be reduced to the monochrome alpha
+        // contract without changing the source colors. Record the attempt so
+        // the enclosing group is discarded at pop even if this rasterization
+        // succeeds and the caller does not distinguish it from an image.
+        self.next_frame
+            .scene
+            .mark_color_glyph_in_linear_gradient_mask_group();
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
@@ -6345,6 +6358,17 @@ impl Window {
     }
 }
 
+/// LCD coverage is defined relative to an opaque destination and therefore
+/// cannot be flattened into the transparent group texture. A mask group forces
+/// a fresh grayscale atlas key; normal text outside the group keeps the exact
+/// platform-selected LCD mode.
+fn use_subpixel_glyph_rasterization(
+    platform_requests_subpixel: bool,
+    inside_linear_mask_group: bool,
+) -> bool {
+    platform_requests_subpixel && !inside_linear_mask_group
+}
+
 // #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 slotmap::new_key_type! {
     /// A unique identifier for a window.
@@ -6875,11 +6899,41 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use crate::{
-        AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Pixels, Render, Styled as _, TestAppContext, Window, canvas, div, px,
-        size,
+        AppContext as _, AtlasKey, AtlasTextureKind, Bounds, Context, FocusHandle, FontId,
+        GlyphId, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
+        RenderGlyphParams, Styled as _, TestAppContext, Window, canvas, div, point, px, size,
     };
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn linear_mask_groups_force_grayscale_without_changing_normal_lcd_text() {
+        assert!(super::use_subpixel_glyph_rasterization(true, false));
+        assert!(!super::use_subpixel_glyph_rasterization(true, true));
+        assert!(!super::use_subpixel_glyph_rasterization(false, false));
+        assert!(!super::use_subpixel_glyph_rasterization(false, true));
+    }
+
+    #[test]
+    fn masked_grayscale_glyph_uses_a_distinct_monochrome_atlas_key() {
+        let lcd = RenderGlyphParams {
+            font_id: FontId(3),
+            glyph_id: GlyphId(9),
+            font_size: px(16.0),
+            subpixel_variant: point(1, 2),
+            scale_factor: 1.0,
+            is_emoji: false,
+            subpixel_rendering: true,
+            dilation: 0,
+        };
+        let mut grayscale = lcd.clone();
+        grayscale.subpixel_rendering = false;
+        let lcd_key = AtlasKey::from(lcd);
+        let grayscale_key = AtlasKey::from(grayscale);
+
+        assert!(lcd_key != grayscale_key);
+        assert_eq!(lcd_key.texture_kind(), AtlasTextureKind::Subpixel);
+        assert_eq!(grayscale_key.texture_kind(), AtlasTextureKind::Monochrome);
+    }
 
     struct RootView {
         explicit_size: bool,

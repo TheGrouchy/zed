@@ -310,6 +310,7 @@ struct ActiveLinearGradientMaskGroup {
     mask: LinearGradientMaskParams,
     scene: Box<Scene>,
     paint_operation_start: usize,
+    color_glyph_attempted: bool,
 }
 
 /// A failure that prevents a subtree mask from being represented exactly.
@@ -325,8 +326,10 @@ pub enum LinearGradientMaskGroupError {
     BackdropBlur,
     /// Platform video surfaces cannot be sampled into the mask texture.
     Surface,
-    /// LCD subpixel text cannot be flattened into a transparent alpha group.
-    SubpixelText,
+    /// A cached or manually inserted LCD sprite bypassed grayscale glyph rasterization.
+    UnconvertedSubpixelText,
+    /// Color-font glyphs need a separately certified alpha/color contract.
+    ColorGlyph,
 }
 
 impl fmt::Display for LinearGradientMaskGroupError {
@@ -337,8 +340,17 @@ impl fmt::Display for LinearGradientMaskGroupError {
             Self::UnbalancedLayer => write!(formatter, "linear mask group has an unbalanced layer"),
             Self::BackdropBlur => write!(formatter, "linear mask group contains a backdrop blur"),
             Self::Surface => write!(formatter, "linear mask group contains a platform surface"),
-            Self::SubpixelText => {
-                write!(formatter, "linear mask group contains LCD subpixel text")
+            Self::UnconvertedSubpixelText => {
+                write!(
+                    formatter,
+                    "linear mask group contains an unconverted LCD subpixel sprite"
+                )
+            }
+            Self::ColorGlyph => {
+                write!(
+                    formatter,
+                    "linear mask group contains an unsupported color-font glyph"
+                )
             }
         }
     }
@@ -504,8 +516,25 @@ impl Scene {
             mask,
             scene: Box::default(),
             paint_operation_start,
+            color_glyph_attempted: false,
         });
         Ok(())
+    }
+
+    /// Whether new monochrome glyphs must use grayscale alpha rasterization.
+    ///
+    /// Paint-cache replay can still introduce a previously rasterized LCD
+    /// sprite. The matching pop validation rejects that stale representation.
+    pub(crate) fn has_active_linear_gradient_mask_group(&self) -> bool {
+        self.active_linear_gradient_mask_group.is_some()
+    }
+
+    /// Records an attempted color-font glyph so group completion can discard
+    /// the entire subtree instead of silently treating it as a normal image.
+    pub(crate) fn mark_color_glyph_in_linear_gradient_mask_group(&mut self) {
+        if let Some(group) = self.active_linear_gradient_mask_group.as_mut() {
+            group.color_glyph_attempted = true;
+        }
     }
 
     /// Finishes the active group, rejecting child constructs that cannot be
@@ -521,8 +550,10 @@ impl Scene {
             Err(LinearGradientMaskGroupError::BackdropBlur)
         } else if !active.scene.surfaces.is_empty() {
             Err(LinearGradientMaskGroupError::Surface)
+        } else if active.color_glyph_attempted {
+            Err(LinearGradientMaskGroupError::ColorGlyph)
         } else if !active.scene.subpixel_sprites.is_empty() {
-            Err(LinearGradientMaskGroupError::SubpixelText)
+            Err(LinearGradientMaskGroupError::UnconvertedSubpixelText)
         } else {
             Ok(())
         };
@@ -1668,6 +1699,47 @@ mod linear_gradient_mask_tests {
         }
     }
 
+    fn group_atlas_tile(kind: crate::AtlasTextureKind) -> AtlasTile {
+        AtlasTile {
+            texture_id: AtlasTextureId { index: 7, kind },
+            tile_id: crate::TileId(11),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: crate::DevicePixels(8),
+                    height: crate::DevicePixels(12),
+                },
+            },
+        }
+    }
+
+    fn group_monochrome_sprite() -> MonochromeSprite {
+        let bounds = group_quad(10.0).bounds;
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            color: Hsla::default(),
+            tile: group_atlas_tile(crate::AtlasTextureKind::Monochrome),
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    fn group_subpixel_sprite() -> SubpixelSprite {
+        let mono = group_monochrome_sprite();
+        SubpixelSprite {
+            order: mono.order,
+            pad: mono.pad,
+            bounds: mono.bounds,
+            content_mask: mono.content_mask,
+            color: mono.color,
+            tile: group_atlas_tile(crate::AtlasTextureKind::Subpixel),
+            transformation: mono.transformation,
+        }
+    }
+
     #[test]
     fn mask_group_preserves_overlapping_children_as_one_atomic_batch() {
         let mut scene = Scene::default();
@@ -1689,6 +1761,52 @@ mod linear_gradient_mask_tests {
             scene.batches().collect::<Vec<_>>().as_slice(),
             [PrimitiveBatch::LinearGradientMaskGroup(0)]
         ));
+    }
+
+    #[test]
+    fn grayscale_glyph_sprite_is_flattened_inside_the_mask_group() {
+        let mut scene = Scene::default();
+        scene
+            .push_linear_gradient_mask_group(scaled_locked_mask())
+            .unwrap();
+        scene.insert_primitive(group_monochrome_sprite());
+        scene.pop_linear_gradient_mask_group().unwrap();
+        scene.finish();
+
+        let group = &scene.linear_gradient_mask_groups[0].scene;
+        assert_eq!(group.monochrome_sprites.len(), 1);
+        assert!(group.subpixel_sprites.is_empty());
+        assert!(matches!(
+            group.batches().collect::<Vec<_>>().as_slice(),
+            [PrimitiveBatch::MonochromeSprites { .. }]
+        ));
+    }
+
+    #[test]
+    fn stale_lcd_sprite_and_color_glyph_attempts_fail_closed() {
+        let mut stale_lcd = Scene::default();
+        stale_lcd
+            .push_linear_gradient_mask_group(scaled_locked_mask())
+            .unwrap();
+        stale_lcd.insert_primitive(group_subpixel_sprite());
+        assert_eq!(
+            stale_lcd.pop_linear_gradient_mask_group(),
+            Err(LinearGradientMaskGroupError::UnconvertedSubpixelText)
+        );
+        assert!(stale_lcd.linear_gradient_mask_groups.is_empty());
+        assert_eq!(stale_lcd.len(), 0);
+
+        let mut color_glyph = Scene::default();
+        color_glyph
+            .push_linear_gradient_mask_group(scaled_locked_mask())
+            .unwrap();
+        color_glyph.mark_color_glyph_in_linear_gradient_mask_group();
+        assert_eq!(
+            color_glyph.pop_linear_gradient_mask_group(),
+            Err(LinearGradientMaskGroupError::ColorGlyph)
+        );
+        assert!(color_glyph.linear_gradient_mask_groups.is_empty());
+        assert_eq!(color_glyph.len(), 0);
     }
 
     #[test]
@@ -1783,6 +1901,82 @@ mod linear_gradient_mask_tests {
             assert!(
                 shader.contains("flattened_group") && shader.contains("* mask_alpha"),
                 "{renderer} does not apply the mask once to the flattened group texture"
+            );
+        }
+    }
+
+    #[test]
+    fn chromium_masked_glyph_alpha_oracle_matches_group_composite_math() {
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/masked_text_alpha_chromium.json"
+        ))
+        .unwrap();
+        assert_eq!(oracle["chromiumVersion"], "151.0.7922.170");
+        assert_eq!(oracle["deviceScaleFactor"], 1);
+        assert_eq!(oracle["unmaskedNonzeroPixels"], 519);
+        assert_eq!(oracle["maskedNonzeroPixels"], 519);
+        assert_eq!(
+            oracle["pngSha256"],
+            "A1E5FE02DEBB5F913D0545C37C3AED4A489BC9572DB4EF2FAC3928BB6026E468"
+        );
+
+        let width = oracle["localMaskWidth"].as_f64().unwrap();
+        for sample in oracle["samples"].as_array().unwrap() {
+            let x = sample[0].as_f64().unwrap();
+            let unmasked = sample[2].as_f64().unwrap();
+            let masked = sample[3].as_f64().unwrap();
+            // Chromium samples the generated gradient at the pixel center,
+            // then multiplies the flattened glyph alpha by that mask alpha.
+            let expected = (unmasked * ((x + 0.5) / width)).round();
+            assert!(
+                (masked - expected).abs() <= 1.0,
+                "x={x}: expected {expected}, got {masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_group_backend_uses_the_grayscale_sprite_path() {
+        let directx = include_str!("../../gpui_windows/src/directx_renderer.rs");
+        assert!(directx.contains("self.draw_scene_batches(&group.scene"));
+        assert!(directx.contains("PrimitiveBatch::MonochromeSprites"));
+
+        let wgpu = include_str!("../../gpui_wgpu/src/wgpu_renderer.rs");
+        assert!(wgpu.contains("fn encode_flat_scene("));
+        assert!(wgpu.contains("PrimitiveBatch::MonochromeSprites"));
+
+        let metal = include_str!("../../gpui_macos/src/metal_renderer.rs");
+        assert!(metal.contains("fn draw_flat_scene_to_texture("));
+        assert!(metal.contains("PrimitiveBatch::MonochromeSprites"));
+        assert!(metal.contains("PrimitiveBatch::SubpixelSprites { .. }"));
+
+        for (renderer, shader, alpha_expression, composite_expression) in [
+            (
+                "DirectX HLSL",
+                include_str!("../../gpui_windows/src/shaders.hlsl"),
+                "input.color.a * alpha_corrected",
+                "flattened_group * mask_alpha",
+            ),
+            (
+                "WGPU WGSL",
+                include_str!("../../gpui_wgpu/src/shaders.wgsl"),
+                "blend_color(input.color, alpha_corrected)",
+                "flattened_group * mask_alpha",
+            ),
+            (
+                "macOS Metal",
+                include_str!("../../gpui_macos/src/shaders.metal"),
+                "color.a *= sample.a",
+                "flattened_group_pixel * mask_alpha",
+            ),
+        ] {
+            assert!(
+                shader.contains(alpha_expression),
+                "{renderer} does not preserve grayscale glyph alpha before group compositing"
+            );
+            assert!(
+                shader.contains(composite_expression),
+                "{renderer} does not multiply the flattened glyph alpha by the mask"
             );
         }
     }
