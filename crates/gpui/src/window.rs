@@ -7,13 +7,13 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, BackdropBlur, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, LinearGradientMask, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, BackdropBlur, ScaledPixels, Scene, Shadow, SharedString,
+    Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
@@ -4128,6 +4128,10 @@ impl Window {
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
             fade: self.scaled_edge_fade(),
+            mask_alignment_pad: 0,
+            mask: quad
+                .mask
+                .map_or_else(Default::default, |mask| mask.scale(self.scale_factor())),
         };
 
         if !quad.background.is_transparent() {
@@ -6743,6 +6747,8 @@ pub struct PaintQuad {
     pub border_colors: Option<Edges<Hsla>>,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// An optional cardinal linear alpha mask over an explicit mask box.
+    pub mask: Option<LinearGradientMask>,
 }
 
 impl PaintQuad {
@@ -6786,6 +6792,14 @@ impl PaintQuad {
             ..self
         }
     }
+
+    /// Sets an exact cardinal linear alpha mask for this primitive.
+    pub fn linear_gradient_mask(self, mask: LinearGradientMask) -> Self {
+        PaintQuad {
+            mask: Some(mask),
+            ..self
+        }
+    }
 }
 
 /// Creates a quad with the given parameters.
@@ -6805,6 +6819,7 @@ pub fn quad(
         border_color: border_color.into(),
         border_colors: None,
         border_style,
+        mask: None,
     }
 }
 
@@ -6818,6 +6833,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_color: transparent_black(),
         border_colors: None,
         border_style: BorderStyle::default(),
+        mask: None,
     }
 }
 
@@ -6835,6 +6851,7 @@ pub fn outline(
         border_color: border_color.into(),
         border_colors: None,
         border_style,
+        mask: None,
     }
 }
 

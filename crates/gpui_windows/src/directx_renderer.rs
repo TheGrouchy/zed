@@ -1799,6 +1799,19 @@ pub(crate) mod shader_resources {
             }
         }
     }
+
+    #[cfg(all(test, debug_assertions))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn quad_mask_shaders_compile_with_fxc() {
+            build_shader_blob(ShaderModule::Quad, ShaderTarget::Vertex)
+                .expect("quad vertex shader must compile");
+            build_shader_blob(ShaderModule::Quad, ShaderTarget::Fragment)
+                .expect("quad fragment shader with native mask must compile");
+        }
+    }
 }
 
 mod nvidia {

@@ -453,6 +453,86 @@ float4 gradient_color(Background background,
     return color;
 }
 
+struct LinearGradientMaskStop {
+    float alpha;
+    float percentage;
+    float offset;
+};
+
+struct EdgeFadeParams {
+    float top_y;
+    float bottom_y;
+    float band_top;
+    float band_bottom;
+    float left_x;
+    float right_x;
+    float band_left;
+    float band_right;
+};
+
+struct LinearGradientMaskParams {
+    Bounds bounds;
+    uint direction;
+    uint stop_count;
+    LinearGradientMaskStop stops[5];
+    uint pad;
+};
+
+float linear_gradient_mask_alpha(float2 position, LinearGradientMaskParams mask) {
+    if (mask.stop_count < 2u) {
+        return 1.0;
+    }
+    float2 minimum = mask.bounds.origin;
+    float2 maximum = mask.bounds.origin + mask.bounds.size;
+    if (position.x < minimum.x || position.x > maximum.x ||
+        position.y < minimum.y || position.y > maximum.y) {
+        return 0.0;
+    }
+
+    float axis_position;
+    float axis_length;
+    switch (mask.direction) {
+        case 0u:
+            axis_position = maximum.y - position.y;
+            axis_length = mask.bounds.size.y;
+            break;
+        case 1u:
+            axis_position = position.x - minimum.x;
+            axis_length = mask.bounds.size.x;
+            break;
+        case 2u:
+            axis_position = position.y - minimum.y;
+            axis_length = mask.bounds.size.y;
+            break;
+        default:
+            axis_position = maximum.x - position.x;
+            axis_length = mask.bounds.size.x;
+            break;
+    }
+
+    uint stop_count = clamp(mask.stop_count, 2u, 5u);
+    uint stop_index = 0u;
+    [unroll]
+    for (uint index = 1u; index < 5u; index++) {
+        float stop_position = mask.stops[index].percentage * axis_length + mask.stops[index].offset;
+        if (index < stop_count && axis_position >= stop_position) {
+            stop_index = index;
+        }
+    }
+    if (stop_index == stop_count - 1u) {
+        return mask.stops[stop_index].alpha;
+    }
+    float start = mask.stops[stop_index].percentage * axis_length + mask.stops[stop_index].offset;
+    float end = mask.stops[stop_index + 1u].percentage * axis_length + mask.stops[stop_index + 1u].offset;
+    if (axis_position < start) {
+        return mask.stops[stop_index].alpha;
+    }
+    float factor = end > start
+        ? clamp((axis_position - start) / (end - start), 0.0, 1.0)
+        : 1.0;
+    return lerp(mask.stops[stop_index].alpha, mask.stops[stop_index + 1u].alpha, factor);
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //
@@ -526,6 +606,9 @@ struct Quad {
     HslaEdges border_colors;
     Corners corner_radii;
     Edges border_widths;
+    EdgeFadeParams fade;
+    uint mask_alignment_pad;
+    LinearGradientMaskParams mask;
 };
 
 struct QuadVertexOutput {
@@ -580,6 +663,8 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+    float mask_alpha = linear_gradient_mask_alpha(input.position.xy, quad.mask);
+    background_color.a *= mask_alpha;
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
@@ -687,15 +772,18 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
         bool border_is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
-        Hsla selected_border_color = center_to_point.x < 0.0
-            ? quad.border_colors.left
-            : quad.border_colors.right;
+        Hsla selected_border_color = quad.border_colors.right;
+        if (center_to_point.x < 0.0) {
+            selected_border_color = quad.border_colors.left;
+        }
         if (border_is_horizontal) {
-            selected_border_color = center_to_point.y < 0.0
-                ? quad.border_colors.top
-                : quad.border_colors.bottom;
+            selected_border_color = quad.border_colors.bottom;
+            if (center_to_point.y < 0.0) {
+                selected_border_color = quad.border_colors.top;
+            }
         }
         float4 border_color = hsla_to_rgba(selected_border_color);
+        border_color.a *= mask_alpha;
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
             // Position along the perimeter in "dash space", where each dash

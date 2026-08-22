@@ -9,7 +9,7 @@ use crate::{
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
-    fmt::Debug,
+    fmt::{self, Debug},
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
@@ -21,6 +21,243 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
+
+/// A cardinal direction for a CSS-compatible linear alpha mask.
+///
+/// The locked Waypath masks use only `to top`, `to right`, and `to bottom`.
+/// Keeping the direction finite prevents an arbitrary-angle implementation
+/// from being presented as CSS-exact before it has renderer conformance.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum LinearGradientMaskDirection {
+    /// The gradient progresses from the bottom edge to the top edge.
+    ToTop = 0,
+    /// The gradient progresses from the left edge to the right edge.
+    ToRight = 1,
+    /// The gradient progresses from the top edge to the bottom edge.
+    #[default]
+    ToBottom = 2,
+    /// The gradient progresses from the right edge to the left edge.
+    ToLeft = 3,
+}
+
+/// A stop in a linear alpha mask.
+///
+/// `percentage * mask_axis_length + offset` represents both percentages and
+/// source values such as `calc(100% - 30px)` without resolving them early.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct LinearGradientMaskStop {
+    /// The mask alpha at this stop, in the inclusive range 0..=1.
+    pub alpha: f32,
+    /// Percentage of the mask axis, in the inclusive range 0..=1.
+    pub percentage: f32,
+    /// Pixel offset added after resolving `percentage`.
+    pub offset: Pixels,
+}
+
+/// The largest stop list represented by the native mask shader ABI.
+pub const MAX_LINEAR_GRADIENT_MASK_STOPS: usize = 5;
+
+/// A single CSS-default linear mask layer over an explicit mask border box.
+///
+/// This type intentionally represents only the locked longhand defaults:
+/// `mask-size:auto`, `mask-position:0% 0%`, `mask-repeat:repeat`,
+/// `mask-origin:border-box`, `mask-clip:border-box`, `mask-composite:add`, and
+/// alpha mode for a generated gradient image. Other mask layers cannot be
+/// constructed through this API and therefore fail closed at the adapter.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(C)]
+pub struct LinearGradientMask {
+    bounds: Bounds<Pixels>,
+    direction: LinearGradientMaskDirection,
+    stop_count: u32,
+    stops: [LinearGradientMaskStop; MAX_LINEAR_GRADIENT_MASK_STOPS],
+    pad: u32,
+}
+
+impl LinearGradientMask {
+    /// Creates a validated cardinal linear alpha mask.
+    pub fn try_new(
+        bounds: Bounds<Pixels>,
+        direction: LinearGradientMaskDirection,
+        stops: &[LinearGradientMaskStop],
+    ) -> Result<Self, LinearGradientMaskError> {
+        if !bounds.origin.x.0.is_finite()
+            || !bounds.origin.y.0.is_finite()
+            || !bounds.size.width.0.is_finite()
+            || !bounds.size.height.0.is_finite()
+            || bounds.size.width.0 <= 0.0
+            || bounds.size.height.0 <= 0.0
+        {
+            return Err(LinearGradientMaskError::InvalidBounds);
+        }
+        if !(2..=MAX_LINEAR_GRADIENT_MASK_STOPS).contains(&stops.len()) {
+            return Err(LinearGradientMaskError::InvalidStopCount(stops.len()));
+        }
+
+        let axis_length = match direction {
+            LinearGradientMaskDirection::ToTop | LinearGradientMaskDirection::ToBottom => {
+                bounds.size.height.0
+            }
+            LinearGradientMaskDirection::ToRight | LinearGradientMaskDirection::ToLeft => {
+                bounds.size.width.0
+            }
+        };
+        let mut previous_position = f32::NEG_INFINITY;
+        for (index, stop) in stops.iter().enumerate() {
+            if !stop.alpha.is_finite()
+                || !(0.0..=1.0).contains(&stop.alpha)
+                || !stop.percentage.is_finite()
+                || !(0.0..=1.0).contains(&stop.percentage)
+                || !stop.offset.0.is_finite()
+            {
+                return Err(LinearGradientMaskError::InvalidStop(index));
+            }
+            let position = stop.percentage * axis_length + stop.offset.0;
+            if position < previous_position {
+                return Err(LinearGradientMaskError::StopsOutOfOrder(index));
+            }
+            previous_position = position;
+        }
+
+        let mut stored_stops = [LinearGradientMaskStop::default(); MAX_LINEAR_GRADIENT_MASK_STOPS];
+        stored_stops[..stops.len()].copy_from_slice(stops);
+        Ok(Self {
+            bounds,
+            direction,
+            stop_count: stops.len() as u32,
+            stops: stored_stops,
+            pad: 0,
+        })
+    }
+
+    /// Evaluates the exact scalar alpha ramp used by each renderer shader.
+    pub fn alpha_at(&self, position: Point<Pixels>) -> f32 {
+        if position.x < self.bounds.left()
+            || position.x > self.bounds.right()
+            || position.y < self.bounds.top()
+            || position.y > self.bounds.bottom()
+        {
+            return 0.0;
+        }
+
+        let (axis_position, axis_length) = match self.direction {
+            LinearGradientMaskDirection::ToTop => (
+                self.bounds.bottom().0 - position.y.0,
+                self.bounds.size.height.0,
+            ),
+            LinearGradientMaskDirection::ToRight => (
+                position.x.0 - self.bounds.left().0,
+                self.bounds.size.width.0,
+            ),
+            LinearGradientMaskDirection::ToBottom => (
+                position.y.0 - self.bounds.top().0,
+                self.bounds.size.height.0,
+            ),
+            LinearGradientMaskDirection::ToLeft => (
+                self.bounds.right().0 - position.x.0,
+                self.bounds.size.width.0,
+            ),
+        };
+        let stops = &self.stops[..self.stop_count as usize];
+        let resolved =
+            |stop: &LinearGradientMaskStop| stop.percentage * axis_length + stop.offset.0;
+        if axis_position < resolved(&stops[0]) {
+            return stops[0].alpha;
+        }
+        let mut index = 0;
+        while index + 1 < stops.len() && axis_position >= resolved(&stops[index + 1]) {
+            index += 1;
+        }
+        if index + 1 == stops.len() {
+            return stops[index].alpha;
+        }
+        let start = resolved(&stops[index]);
+        let end = resolved(&stops[index + 1]);
+        if end == start {
+            return stops[index + 1].alpha;
+        }
+        let factor = ((axis_position - start) / (end - start)).clamp(0.0, 1.0);
+        stops[index].alpha + (stops[index + 1].alpha - stops[index].alpha) * factor
+    }
+
+    pub(crate) fn scale(self, factor: f32) -> LinearGradientMaskParams {
+        let mut stops = [ScaledLinearGradientMaskStop::default(); MAX_LINEAR_GRADIENT_MASK_STOPS];
+        for (target, source) in stops.iter_mut().zip(self.stops) {
+            *target = ScaledLinearGradientMaskStop {
+                alpha: source.alpha,
+                percentage: source.percentage,
+                offset: ScaledPixels(source.offset.0 * factor),
+            };
+        }
+        LinearGradientMaskParams {
+            bounds: self.bounds.scale(factor),
+            direction: self.direction,
+            stop_count: self.stop_count,
+            stops,
+            pad: 0,
+        }
+    }
+}
+
+/// Validation failure for a native linear gradient mask.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LinearGradientMaskError {
+    /// The mask bounds are empty or non-finite.
+    InvalidBounds,
+    /// The native ABI requires two through five stops.
+    InvalidStopCount(usize),
+    /// A stop contains a non-finite or out-of-range value.
+    InvalidStop(usize),
+    /// Resolved stop positions are not monotonically nondecreasing.
+    StopsOutOfOrder(usize),
+}
+
+impl fmt::Display for LinearGradientMaskError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBounds => {
+                write!(formatter, "linear mask bounds must be finite and positive")
+            }
+            Self::InvalidStopCount(count) => {
+                write!(
+                    formatter,
+                    "linear mask requires two through five stops, got {count}"
+                )
+            }
+            Self::InvalidStop(index) => write!(formatter, "linear mask stop {index} is invalid"),
+            Self::StopsOutOfOrder(index) => {
+                write!(
+                    formatter,
+                    "linear mask stop {index} resolves before its predecessor"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LinearGradientMaskError {}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct ScaledLinearGradientMaskStop {
+    pub alpha: f32,
+    pub percentage: f32,
+    pub offset: ScaledPixels,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[repr(C, align(8))]
+#[expect(missing_docs)]
+pub struct LinearGradientMaskParams {
+    pub bounds: Bounds<ScaledPixels>,
+    pub direction: LinearGradientMaskDirection,
+    pub stop_count: u32,
+    pub stops: [ScaledLinearGradientMaskStop; MAX_LINEAR_GRADIENT_MASK_STOPS],
+    pub pad: u32,
+}
 
 /// A boolean stored as a `u32` so that GPU-facing structs contain no
 /// compiler-inserted padding bytes, which would be undefined behavior to
@@ -584,6 +821,8 @@ pub struct Quad {
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     pub fade: EdgeFadeParams,
+    pub mask_alignment_pad: u32,
+    pub mask: LinearGradientMaskParams,
 }
 
 impl From<Quad> for Primitive {
@@ -1003,6 +1242,221 @@ impl PathVertex<Pixels> {
             xy_position: self.xy_position.scale(factor),
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
+        }
+    }
+}
+
+#[cfg(test)]
+mod linear_gradient_mask_tests {
+    use super::*;
+
+    fn mask_bounds() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(Pixels(10.0), Pixels(20.0)),
+            size: Size {
+                width: Pixels(200.0),
+                height: Pixels(100.0),
+            },
+        }
+    }
+
+    fn stop(alpha: f32, percentage: f32, offset: f32) -> LinearGradientMaskStop {
+        LinearGradientMaskStop {
+            alpha,
+            percentage,
+            offset: Pixels(offset),
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= f32::EPSILON * 8.0,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn locked_vertical_ascii_fade_matches_source_stops() {
+        let mask = LinearGradientMask::try_new(
+            mask_bounds(),
+            LinearGradientMaskDirection::ToBottom,
+            &[
+                stop(1.0, 0.0, 0.0),
+                stop(1.0, 0.7, 0.0),
+                stop(0.0, 1.0, 0.0),
+            ],
+        )
+        .unwrap();
+
+        assert_close(mask.alpha_at(point(Pixels(50.0), Pixels(20.0))), 1.0);
+        assert_close(mask.alpha_at(point(Pixels(50.0), Pixels(90.0))), 1.0);
+        assert_close(mask.alpha_at(point(Pixels(50.0), Pixels(105.0))), 0.5);
+        assert_close(mask.alpha_at(point(Pixels(50.0), Pixels(120.0))), 0.0);
+    }
+
+    #[test]
+    fn locked_ticker_mask_resolves_pixel_and_calc_stops() {
+        let mask = LinearGradientMask::try_new(
+            mask_bounds(),
+            LinearGradientMaskDirection::ToRight,
+            &[
+                stop(0.0, 0.0, 0.0),
+                stop(1.0, 0.0, 30.0),
+                stop(1.0, 1.0, -30.0),
+                stop(0.0, 1.0, 0.0),
+            ],
+        )
+        .unwrap();
+
+        assert_close(mask.alpha_at(point(Pixels(10.0), Pixels(50.0))), 0.0);
+        assert_close(mask.alpha_at(point(Pixels(25.0), Pixels(50.0))), 0.5);
+        assert_close(mask.alpha_at(point(Pixels(110.0), Pixels(50.0))), 1.0);
+        assert_close(mask.alpha_at(point(Pixels(195.0), Pixels(50.0))), 0.5);
+        assert_close(mask.alpha_at(point(Pixels(210.0), Pixels(50.0))), 0.0);
+    }
+
+    #[test]
+    fn locked_soft_skin_mask_preserves_bottom_to_top_alpha() {
+        let mask = LinearGradientMask::try_new(
+            mask_bounds(),
+            LinearGradientMaskDirection::ToTop,
+            &[
+                stop(1.0, 0.06, 0.0),
+                stop(0.4, 0.52, 0.0),
+                stop(0.0, 0.9, 0.0),
+            ],
+        )
+        .unwrap();
+
+        assert_close(mask.alpha_at(point(Pixels(50.0), Pixels(120.0))), 1.0);
+        assert_close(mask.alpha_at(point(Pixels(50.0), Pixels(68.0))), 0.4);
+        assert_close(mask.alpha_at(point(Pixels(50.0), Pixels(30.0))), 0.0);
+    }
+
+    #[test]
+    fn invalid_masks_fail_closed() {
+        assert_eq!(
+            LinearGradientMask::try_new(
+                mask_bounds(),
+                LinearGradientMaskDirection::ToBottom,
+                &[stop(1.0, 0.0, 0.0)]
+            ),
+            Err(LinearGradientMaskError::InvalidStopCount(1))
+        );
+        assert_eq!(
+            LinearGradientMask::try_new(
+                mask_bounds(),
+                LinearGradientMaskDirection::ToBottom,
+                &[stop(1.0, 0.8, 0.0), stop(0.0, 0.2, 0.0)]
+            ),
+            Err(LinearGradientMaskError::StopsOutOfOrder(1))
+        );
+        assert_eq!(
+            LinearGradientMask::try_new(
+                mask_bounds(),
+                LinearGradientMaskDirection::ToBottom,
+                &[stop(1.0, 0.0, 0.0), stop(f32::NAN, 1.0, 0.0)]
+            ),
+            Err(LinearGradientMaskError::InvalidStop(1))
+        );
+        assert_eq!(
+            LinearGradientMask::try_new(
+                Bounds::default(),
+                LinearGradientMaskDirection::ToBottom,
+                &[stop(1.0, 0.0, 0.0), stop(0.0, 1.0, 0.0)]
+            ),
+            Err(LinearGradientMaskError::InvalidBounds)
+        );
+    }
+
+    #[test]
+    fn mask_shader_abi_has_explicit_cross_renderer_stride() {
+        assert_eq!(std::mem::size_of::<LinearGradientMaskStop>(), 12);
+        assert_eq!(std::mem::size_of::<ScaledLinearGradientMaskStop>(), 12);
+        assert_eq!(std::mem::size_of::<LinearGradientMaskParams>(), 88);
+        assert_eq!(std::mem::align_of::<LinearGradientMaskParams>(), 8);
+        assert_eq!(
+            std::mem::offset_of!(Quad, mask),
+            std::mem::offset_of!(Quad, fade) + std::mem::size_of::<EdgeFadeParams>() + 4
+        );
+        assert_eq!(std::mem::offset_of!(Quad, mask) % 8, 0);
+    }
+
+    #[test]
+    fn no_mask_params_are_an_alpha_identity() {
+        let params = LinearGradientMaskParams::default();
+        assert_eq!(params.stop_count, 0);
+        let mask = LinearGradientMask::try_new(
+            mask_bounds(),
+            LinearGradientMaskDirection::ToLeft,
+            &[stop(0.0, 0.0, 0.0), stop(1.0, 1.0, 0.0)],
+        )
+        .unwrap();
+        assert_close(mask.alpha_at(point(Pixels(210.0), Pixels(50.0))), 0.0);
+        assert_close(mask.alpha_at(point(Pixels(10.0), Pixels(50.0))), 1.0);
+    }
+
+    #[test]
+    fn paint_quad_retains_and_scales_the_validated_mask() {
+        let mask = LinearGradientMask::try_new(
+            mask_bounds(),
+            LinearGradientMaskDirection::ToRight,
+            &[stop(0.0, 0.0, 30.0), stop(1.0, 1.0, -30.0)],
+        )
+        .unwrap();
+        let paint_quad = crate::fill(mask_bounds(), Hsla::default()).linear_gradient_mask(mask);
+        assert_eq!(paint_quad.mask, Some(mask));
+
+        let scaled = mask.scale(2.0);
+        assert_eq!(
+            scaled.bounds.origin,
+            point(ScaledPixels(20.0), ScaledPixels(40.0))
+        );
+        assert_eq!(
+            scaled.bounds.size,
+            Size {
+                width: ScaledPixels(400.0),
+                height: ScaledPixels(200.0),
+            }
+        );
+        assert_eq!(scaled.stops[0].offset, ScaledPixels(60.0));
+        assert_eq!(scaled.stops[1].offset, ScaledPixels(-60.0));
+    }
+
+    #[test]
+    fn every_renderer_applies_the_native_mask_to_quad_fill_and_border() {
+        for (renderer, shader) in [
+            (
+                "DirectX HLSL",
+                include_str!("../../gpui_windows/src/shaders.hlsl"),
+            ),
+            (
+                "WGPU WGSL",
+                include_str!("../../gpui_wgpu/src/shaders.wgsl"),
+            ),
+            (
+                "macOS Metal",
+                include_str!("../../gpui_macos/src/shaders.metal"),
+            ),
+        ] {
+            assert!(
+                shader.contains("linear_gradient_mask_alpha"),
+                "{renderer} is missing the native mask evaluator"
+            );
+            assert!(
+                shader.contains("background_color.a *= mask_alpha"),
+                "{renderer} does not mask quad fills"
+            );
+            assert!(
+                shader.contains("border_color.a *= mask_alpha"),
+                "{renderer} does not mask quad borders"
+            );
+            assert!(
+                shader.contains("stop_count")
+                    && shader.contains("percentage")
+                    && shader.contains("offset"),
+                "{renderer} is missing the typed percentage-plus-pixel stop ABI"
+            );
         }
     }
 }

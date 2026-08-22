@@ -81,6 +81,22 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
+#[cfg(test)]
+mod shader_tests {
+    #[test]
+    fn linear_mask_wgsl_parses_and_validates() {
+        let module = naga::front::wgsl::parse_str(include_str!("shaders.wgsl"))
+            .expect("native mask WGSL must parse");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("native mask WGSL must validate");
+    }
+}
+
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,

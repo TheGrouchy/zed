@@ -35,6 +35,7 @@ float blur_along_x(float x, float y, float sigma, float corner,
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 float edge_fade_alpha(float2 position, EdgeFadeParams fade);
+float linear_gradient_mask_alpha(float2 position, LinearGradientMaskParams mask);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
   float4 solid_color, float4 color0, float4 color1);
 
@@ -106,6 +107,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+  float mask_alpha = linear_gradient_mask_alpha(input.position.xy, quad.mask);
+  background_color.a *= mask_alpha;
   // Per-pixel scoped edge fade — applied to the fill HERE so every return
   // path (including the borderless fast paths) inherits it; the border
   // fades at its own use below.
@@ -228,6 +231,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
           : quad.border_colors.bottom;
     }
     float4 border_color = hsla_to_rgba(selected_border_color);
+    border_color.a *= mask_alpha;
     border_color.a *= edge_fade;
 
     // Dashed border logic when border_style == 1
@@ -1215,6 +1219,61 @@ float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
     ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
   }
   return ramp * ramp;
+}
+
+float linear_gradient_mask_alpha(float2 position, LinearGradientMaskParams mask) {
+  if (mask.stop_count < 2u) {
+    return 1.0;
+  }
+  float2 minimum = float2(mask.bounds.origin.x, mask.bounds.origin.y);
+  float2 mask_size = float2(mask.bounds.size.width, mask.bounds.size.height);
+  float2 maximum = minimum + mask_size;
+  if (position.x < minimum.x || position.x > maximum.x ||
+      position.y < minimum.y || position.y > maximum.y) {
+    return 0.0;
+  }
+
+  float axis_position = 0.0;
+  float axis_length = 0.0;
+  switch (mask.direction) {
+    case 0:
+      axis_position = maximum.y - position.y;
+      axis_length = mask_size.y;
+      break;
+    case 1:
+      axis_position = position.x - minimum.x;
+      axis_length = mask_size.x;
+      break;
+    case 2:
+      axis_position = position.y - minimum.y;
+      axis_length = mask_size.y;
+      break;
+    default:
+      axis_position = maximum.x - position.x;
+      axis_length = mask_size.x;
+      break;
+  }
+
+  uint stop_count = clamp(mask.stop_count, 2u, 5u);
+  uint stop_index = 0u;
+  for (uint index = 1u; index < 5u; index++) {
+    float stop_position = mask.stops[index].percentage * axis_length + mask.stops[index].offset;
+    if (index < stop_count && axis_position >= stop_position) {
+      stop_index = index;
+    }
+  }
+  if (stop_index == stop_count - 1u) {
+    return mask.stops[stop_index].alpha;
+  }
+  float start = mask.stops[stop_index].percentage * axis_length + mask.stops[stop_index].offset;
+  float end = mask.stops[stop_index + 1u].percentage * axis_length + mask.stops[stop_index + 1u].offset;
+  if (axis_position < start) {
+    return mask.stops[stop_index].alpha;
+  }
+  float factor = end > start
+    ? clamp((axis_position - start) / (end - start), 0.0f, 1.0f)
+    : 1.0f;
+  return mix(mask.stops[stop_index].alpha, mask.stops[stop_index + 1u].alpha, factor);
 }
 
 float4 fill_color(Background background,
