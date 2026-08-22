@@ -10,6 +10,8 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+#[cfg(test)]
+mod font_display_swap_tests;
 mod keyboard;
 mod platform;
 mod system_notifications;

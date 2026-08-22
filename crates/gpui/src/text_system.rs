@@ -1,4 +1,5 @@
 mod css_font_face;
+mod font_display;
 mod font_fallbacks;
 mod font_features;
 mod line;
@@ -7,6 +8,7 @@ mod line_wrapper;
 mod white_space;
 
 pub use css_font_face::*;
+pub use font_display::*;
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
