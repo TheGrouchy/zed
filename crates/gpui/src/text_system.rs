@@ -1,3 +1,4 @@
+mod css_font_face;
 mod font_fallbacks;
 mod font_features;
 mod line;
@@ -5,6 +6,7 @@ mod line_layout;
 mod line_wrapper;
 mod white_space;
 
+pub use css_font_face::*;
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
@@ -103,6 +105,12 @@ impl TextSystem {
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform_text_system.add_fonts(fonts)
+    }
+
+    /// Register byte-exact embedded resources together with their ordered CSS
+    /// `@font-face` family, style, weight, and Unicode coverage rules.
+    pub fn add_css_font_faces(&self, registry: CssFontFaceRegistry) -> Result<()> {
+        self.platform_text_system.add_css_font_faces(registry)
     }
 
     /// Get the FontId for the configure font family and style.

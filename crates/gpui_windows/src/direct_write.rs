@@ -4,7 +4,7 @@ use std::{
     mem::ManuallyDrop,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use collections::HashMap;
 use gpui_util::{ResultExt, maybe};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
@@ -36,6 +36,24 @@ struct FontInfo {
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
+    css_request: Option<CssFontRequest>,
+}
+
+#[derive(Clone, Debug)]
+struct CssFontRequest {
+    family: SharedString,
+    style: FontStyle,
+    weight: u16,
+}
+
+#[derive(Clone, Debug)]
+struct RegisteredCssFontFace {
+    family: SharedString,
+    style: FontStyle,
+    weight_start: u16,
+    weight_end: u16,
+    unicode_ranges: Vec<CssUnicodeRange>,
+    native_family_alias: SharedString,
 }
 
 pub(crate) struct DirectWriteTextSystem {
@@ -80,6 +98,8 @@ struct DirectWriteState {
     font_to_font_id: HashMap<Font, FontId>,
     font_info_cache: HashMap<usize, FontId>,
     layout_line_scratch: Vec<u16>,
+    css_font_faces: Vec<RegisteredCssFontFace>,
+    css_resource_aliases: HashMap<String, SharedString>,
 }
 
 impl GPUState {
@@ -314,6 +334,8 @@ impl DirectWriteTextSystem {
                 font_to_font_id: HashMap::default(),
                 font_info_cache: HashMap::default(),
                 layout_line_scratch: Vec::new(),
+                css_font_faces: Vec::new(),
+                css_resource_aliases: HashMap::default(),
             }),
         })
     }
@@ -326,6 +348,12 @@ impl DirectWriteTextSystem {
 impl PlatformTextSystem for DirectWriteTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.state.write().add_fonts(&self.components, fonts)
+    }
+
+    fn add_css_font_faces(&self, registry: CssFontFaceRegistry) -> Result<()> {
+        self.state
+            .write()
+            .add_css_font_faces(&self.components, registry)
     }
 
     fn all_font_names(&self) -> Vec<String> {
@@ -401,24 +429,122 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 }
 
 impl DirectWriteState {
+    fn css_weight_rank(requested: u16, start: u16, end: u16) -> (u8, u16) {
+        if (start..=end).contains(&requested) {
+            return (0, 0);
+        }
+        if requested < 400 {
+            if end < requested {
+                (1, requested - end)
+            } else {
+                (2, start.saturating_sub(requested))
+            }
+        } else if requested <= 500 {
+            if start > requested && start <= 500 {
+                (1, start - requested)
+            } else if end < requested {
+                (2, requested - end)
+            } else {
+                (3, start.saturating_sub(500))
+            }
+        } else if start > requested {
+            (1, start - requested)
+        } else {
+            (2, requested - end)
+        }
+    }
+
+    fn select_css_face(
+        &self,
+        family: &str,
+        style: FontStyle,
+        requested_weight: u16,
+        character: Option<char>,
+    ) -> Option<&RegisteredCssFontFace> {
+        let mut best = None::<((u8, u16), usize, &RegisteredCssFontFace)>;
+        for (source_order, face) in self.css_font_faces.iter().enumerate() {
+            if face.family.as_ref() != family
+                || face.style != style
+                || character.is_some_and(|character| {
+                    !face
+                        .unicode_ranges
+                        .iter()
+                        .any(|range| range.contains(character))
+                })
+            {
+                continue;
+            }
+            let rank = Self::css_weight_rank(requested_weight, face.weight_start, face.weight_end);
+            if best.is_none_or(|(best_rank, best_order, _)| {
+                rank < best_rank || (rank == best_rank && source_order > best_order)
+            }) {
+                best = Some((rank, source_order, face));
+            }
+        }
+        best.map(|(_, _, face)| face)
+    }
+
+    fn make_css_font_info(
+        &self,
+        components: &DirectWriteComponents,
+        font: &Font,
+    ) -> Option<FontInfo> {
+        let rounded_weight = font.weight.0.round();
+        if !(1.0..=1000.0).contains(&rounded_weight)
+            || (font.weight.0 - rounded_weight).abs() > f32::EPSILON
+        {
+            return None;
+        }
+        let weight = rounded_weight as u16;
+        let face = self
+            .select_css_face(&font.family, font.style, weight, Some(' '))
+            .or_else(|| self.select_css_face(&font.family, font.style, weight, None))?;
+        let mut physical_font = font.clone();
+        physical_font.family = face.native_family_alias.clone();
+        let mut info = unsafe {
+            Self::make_font_from_font_collection(
+                &physical_font,
+                &self.custom_font_collection,
+                &self.custom_font_collection,
+                &components.factory,
+                &self.system_font_collection,
+                &components.system_ui_font_name,
+            )?
+        };
+        info.css_request = Some(CssFontRequest {
+            family: font.family.clone(),
+            style: font.style,
+            weight,
+        });
+        Some(info)
+    }
+
     fn select_and_cache_font(
         &mut self,
         components: &DirectWriteComponents,
         font: &Font,
     ) -> Option<FontId> {
         let select_font = |this: &mut DirectWriteState, font: &Font| -> Option<FontId> {
-            let info = [&this.custom_font_collection, &this.system_font_collection]
-                .into_iter()
-                .find_map(|font_collection| unsafe {
-                    DirectWriteState::make_font_from_font_collection(
-                        font,
-                        font_collection,
-                        &this.custom_font_collection,
-                        &components.factory,
-                        &this.system_font_collection,
-                        &components.system_ui_font_name,
-                    )
-                })?;
+            let is_registered_css_family = this
+                .css_font_faces
+                .iter()
+                .any(|face| face.family == font.family);
+            let info = if is_registered_css_family {
+                this.make_css_font_info(components, font)?
+            } else {
+                [&this.custom_font_collection, &this.system_font_collection]
+                    .into_iter()
+                    .find_map(|font_collection| unsafe {
+                        DirectWriteState::make_font_from_font_collection(
+                            font,
+                            font_collection,
+                            &this.custom_font_collection,
+                            &components.factory,
+                            &this.system_font_collection,
+                            &components.system_ui_font_name,
+                        )
+                    })?
+            };
 
             let font_id = FontId(this.fonts.len());
             let font_face_key = info.font_face.cast::<IUnknown>().unwrap().as_raw().addr();
@@ -508,6 +634,201 @@ impl DirectWriteState {
         };
         self.custom_font_collection = collection;
 
+        Ok(())
+    }
+
+    fn add_css_font_faces(
+        &mut self,
+        components: &DirectWriteComponents,
+        registry: CssFontFaceRegistry,
+    ) -> Result<()> {
+        for resource in registry.resources() {
+            ensure!(
+                !self
+                    .css_resource_aliases
+                    .contains_key(resource.id().as_ref()),
+                "embedded CSS font resource {} is already registered",
+                resource.id()
+            );
+        }
+
+        let mut pending_resources = Vec::with_capacity(registry.resources().len());
+        for resource in registry.resources() {
+            let data = resource.bytes().as_ref();
+            let font_file = unsafe {
+                components
+                    .in_memory_loader
+                    .CreateInMemoryFontFileReference(
+                        &components.factory,
+                        data.as_ptr().cast(),
+                        data.len() as _,
+                        None,
+                    )?
+            };
+            let temporary_builder = unsafe { components.factory.CreateFontSetBuilder()? };
+            unsafe { temporary_builder.AddFontFile(&font_file)? };
+            let temporary_set = unsafe { temporary_builder.CreateFontSet()? };
+            let font_count = unsafe { temporary_set.GetFontCount() };
+            ensure!(
+                font_count == 1,
+                "embedded CSS font resource {} contains {font_count} faces; exactly one is required",
+                resource.id()
+            );
+            let face_reference = unsafe { temporary_set.GetFontFaceReference(0)? };
+            let face: IDWriteFontFace5 = unsafe { face_reference.CreateFontFace()?.cast()? };
+            let native_alias = resource.native_family_alias();
+            let weight = HSTRING::from(unsafe { face.GetWeight().0 }.to_string());
+            pending_resources.push((
+                resource.id().to_string(),
+                face_reference,
+                native_alias,
+                weight,
+            ));
+        }
+
+        let mut aliases = HashMap::default();
+        for (resource_id, face_reference, native_alias, weight) in pending_resources {
+            let alias = HSTRING::from(native_alias.as_ref());
+            let properties = [
+                DWRITE_FONT_PROPERTY {
+                    propertyId: DWRITE_FONT_PROPERTY_ID_FAMILY_NAME,
+                    propertyValue: PCWSTR(alias.as_ptr()),
+                    localeName: DEFAULT_LOCALE_NAME,
+                },
+                DWRITE_FONT_PROPERTY {
+                    propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+                    propertyValue: PCWSTR(alias.as_ptr()),
+                    localeName: DEFAULT_LOCALE_NAME,
+                },
+                DWRITE_FONT_PROPERTY {
+                    propertyId: DWRITE_FONT_PROPERTY_ID_WEIGHT,
+                    propertyValue: PCWSTR(weight.as_ptr()),
+                    localeName: PCWSTR::null(),
+                },
+            ];
+            unsafe {
+                components
+                    .builder
+                    .AddFontFaceReference(&face_reference, &properties)?;
+            }
+            aliases.insert(resource_id, native_alias);
+        }
+
+        let mut registered_faces = Vec::with_capacity(registry.faces().len());
+        for face in registry.faces() {
+            let native_family_alias = aliases
+                .get(face.resource_id().as_ref())
+                .cloned()
+                .ok_or_else(|| anyhow!("validated CSS font resource disappeared"))?;
+            registered_faces.push(RegisteredCssFontFace {
+                family: face.family().clone(),
+                style: face.style(),
+                weight_start: *face.weights().start(),
+                weight_end: *face.weights().end(),
+                unicode_ranges: face.unicode_ranges().to_vec(),
+                native_family_alias,
+            });
+        }
+
+        let set = unsafe { components.builder.CreateFontSet()? };
+        self.custom_font_collection = unsafe {
+            DirectWriteTextSystem::create_weight_stretch_style_collection(
+                &components.factory,
+                &set,
+            )?
+        };
+        self.css_resource_aliases.extend(aliases);
+        self.css_font_faces.extend(registered_faces);
+        Ok(())
+    }
+
+    unsafe fn apply_css_face_range(
+        &self,
+        layout: &IDWriteTextLayout1,
+        native_family_alias: &SharedString,
+        range: DWRITE_TEXT_RANGE,
+    ) -> Result<()> {
+        let alias = HSTRING::from(native_family_alias.as_ref());
+        unsafe {
+            layout.SetFontCollection(&self.custom_font_collection, range)?;
+            layout.SetFontFamilyName(&alias, range)?;
+        }
+        Ok(())
+    }
+
+    unsafe fn apply_css_face_ranges(
+        &self,
+        text: &str,
+        font_runs: &[FontRun],
+        layout: &IDWriteTextLayout1,
+    ) -> Result<()> {
+        let mut utf8_start = 0usize;
+        let mut utf16_start = 0u32;
+        for run in font_runs {
+            let utf8_end = utf8_start + run.len;
+            ensure!(
+                utf8_end <= text.len()
+                    && text.is_char_boundary(utf8_start)
+                    && text.is_char_boundary(utf8_end),
+                "font run splits source text while selecting CSS faces"
+            );
+            let run_text = &text[utf8_start..utf8_end];
+            let Some(request) = self.fonts[run.font_id.0].css_request.as_ref() else {
+                utf8_start = utf8_end;
+                utf16_start += run_text.encode_utf16().count() as u32;
+                continue;
+            };
+
+            let mut segment_alias = None::<SharedString>;
+            let mut segment_start = utf16_start;
+            let mut position = utf16_start;
+            for character in run_text.chars() {
+                let next_alias = self
+                    .select_css_face(
+                        &request.family,
+                        request.style,
+                        request.weight,
+                        Some(character),
+                    )
+                    .map(|face| face.native_family_alias.clone());
+                if next_alias != segment_alias {
+                    if let Some(alias) = segment_alias.take() {
+                        unsafe {
+                            self.apply_css_face_range(
+                                layout,
+                                &alias,
+                                DWRITE_TEXT_RANGE {
+                                    startPosition: segment_start,
+                                    length: position - segment_start,
+                                },
+                            )?;
+                        }
+                    }
+                    segment_alias = next_alias;
+                    segment_start = position;
+                }
+                position += character.len_utf16() as u32;
+            }
+            if let Some(alias) = segment_alias {
+                unsafe {
+                    self.apply_css_face_range(
+                        layout,
+                        &alias,
+                        DWRITE_TEXT_RANGE {
+                            startPosition: segment_start,
+                            length: position - segment_start,
+                        },
+                    )?;
+                }
+            }
+            utf8_start = utf8_end;
+            utf16_start = position;
+        }
+        ensure!(
+            utf8_start == text.len(),
+            "font runs cover {utf8_start} bytes but source contains {} bytes",
+            text.len()
+        );
         Ok(())
     }
 
@@ -706,6 +1027,7 @@ impl DirectWriteState {
                     features: direct_write_features,
                     fallbacks,
                     font_collection: collection.clone(),
+                    css_request: None,
                 };
                 Some(font_info)
             });
@@ -833,6 +1155,8 @@ impl DirectWriteState {
 
                 break_ligatures = !break_ligatures;
             }
+
+            self.apply_css_face_ranges(text, font_runs, &text_layout)?;
 
             let mut runs = Vec::new();
             let mut renderer_context = RendererContext {
@@ -2164,11 +2488,75 @@ mod tests {
     use crate::DirectXDevices;
     use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
     use gpui::{
-        FontFallbacks, FontRun, Pixels, PlatformTextSystem, TextRun, TextSystem, WhiteSpace,
-        WindowTextSystem, font, prepare_whitespace,
+        CssFontFace, CssFontFaceRegistry, CssUnicodeRange, EmbeddedFontResource, FontFallbacks,
+        FontRun, FontStyle, FontWeight, Pixels, PlatformTextSystem, TextRun, TextSystem,
+        WhiteSpace, WindowTextSystem, font, prepare_whitespace,
     };
 
     const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+    const LILEX_BOLD: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf");
+
+    fn css_subset_registry() -> CssFontFaceRegistry {
+        CssFontFaceRegistry::new(
+            vec![
+                EmbeddedFontResource::new("regular", Cow::Borrowed(LILEX)),
+                EmbeddedFontResource::new("bold", Cow::Borrowed(LILEX_BOLD)),
+            ],
+            vec![
+                CssFontFace::new(
+                    "Waypath CSS Subset",
+                    FontStyle::Normal,
+                    400..=400,
+                    Arc::from([
+                        CssUnicodeRange::new(0x20, 0x20).unwrap(),
+                        CssUnicodeRange::new('A' as u32, 'M' as u32).unwrap(),
+                    ]),
+                    "regular",
+                ),
+                CssFontFace::new(
+                    "Waypath CSS Subset",
+                    FontStyle::Normal,
+                    400..=400,
+                    Arc::from([
+                        CssUnicodeRange::new('N' as u32, 'Z' as u32).unwrap(),
+                        CssUnicodeRange::new('\u{03bb}' as u32, '\u{03bb}' as u32).unwrap(),
+                    ]),
+                    "bold",
+                ),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn css_weight_registry() -> CssFontFaceRegistry {
+        let ranges: Arc<[CssUnicodeRange]> = Arc::from([
+            CssUnicodeRange::new(0x20, 0x20).unwrap(),
+            CssUnicodeRange::new('A' as u32, 'Z' as u32).unwrap(),
+        ]);
+        CssFontFaceRegistry::new(
+            vec![
+                EmbeddedFontResource::new("weight-400", Cow::Borrowed(LILEX)),
+                EmbeddedFontResource::new("weight-700", Cow::Borrowed(LILEX_BOLD)),
+            ],
+            vec![
+                CssFontFace::new(
+                    "Waypath CSS Weight",
+                    FontStyle::Normal,
+                    400..=400,
+                    ranges.clone(),
+                    "weight-400",
+                ),
+                CssFontFace::new(
+                    "Waypath CSS Weight",
+                    FontStyle::Normal,
+                    700..=700,
+                    ranges,
+                    "weight-700",
+                ),
+            ],
+        )
+        .unwrap()
+    }
 
     fn letter_spacing_system() -> DirectWriteTextSystem {
         let devices = DirectXDevices::new().unwrap();
@@ -2228,6 +2616,128 @@ mod tests {
         );
         assert_eq!(layout.runs.len(), 1);
         assert_eq!(layout.runs[0].font_id, custom_id);
+    }
+
+    #[test]
+    fn css_face_registry_selects_unicode_subsets_without_rewriting_source_indices() {
+        let devices = DirectXDevices::new().unwrap();
+        let system = DirectWriteTextSystem::new(&devices).unwrap();
+        system.add_css_font_faces(css_subset_registry()).unwrap();
+
+        let public_id = system.font_id(&font("Waypath CSS Subset")).unwrap();
+        let regular_id = system.font_id(&font(".GPUIEmbeddedFont.regular")).unwrap();
+        let bold_id = system.font_id(&font(".GPUIEmbeddedFont.bold")).unwrap();
+
+        let text = "AMN\u{03bb}Z";
+        let layout = system.layout_line(
+            text,
+            Pixels::from(32.0),
+            &[FontRun {
+                len: text.len(),
+                font_id: public_id,
+                letter_spacing: Pixels::ZERO,
+            }],
+        );
+        let run_ids = layout
+            .runs
+            .iter()
+            .map(|run| run.font_id)
+            .collect::<Vec<_>>();
+        assert_eq!(run_ids.first(), Some(&regular_id));
+        assert!(
+            run_ids.len() >= 2 && run_ids[1..].iter().all(|font_id| *font_id == bold_id),
+            "all N-Z and Greek subset runs must resolve to the bold resource: {run_ids:?}"
+        );
+        let source_indices = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .collect::<Vec<_>>();
+        assert_eq!(source_indices, vec![0, 1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn css_face_registry_preserves_system_fallback_boundaries_and_indices() {
+        let devices = DirectXDevices::new().unwrap();
+        let system = DirectWriteTextSystem::new(&devices).unwrap();
+        system.add_css_font_faces(css_subset_registry()).unwrap();
+
+        let public_id = system.font_id(&font("Waypath CSS Subset")).unwrap();
+        let regular_id = system.font_id(&font(".GPUIEmbeddedFont.regular")).unwrap();
+        let bold_id = system.font_id(&font(".GPUIEmbeddedFont.bold")).unwrap();
+        let text = "A\u{1f600}N";
+        let layout = system.layout_line(
+            text,
+            Pixels::from(32.0),
+            &[FontRun {
+                len: text.len(),
+                font_id: public_id,
+                letter_spacing: Pixels::ZERO,
+            }],
+        );
+        assert_eq!(layout.runs.first().unwrap().font_id, regular_id);
+        assert_eq!(layout.runs.last().unwrap().font_id, bold_id);
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font_id != regular_id && run.font_id != bold_id),
+            "system fallback must own the uncovered emoji run"
+        );
+        let source_indices = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .collect::<Vec<_>>();
+        assert_eq!(source_indices, vec![0, 1, 5]);
+    }
+
+    #[test]
+    fn css_face_registry_uses_css_weight_matching_order_and_fails_closed_on_style() {
+        let devices = DirectXDevices::new().unwrap();
+        let system = DirectWriteTextSystem::new(&devices).unwrap();
+        system.add_css_font_faces(css_weight_registry()).unwrap();
+
+        let regular_id = system
+            .font_id(&font(".GPUIEmbeddedFont.weight-400"))
+            .unwrap();
+        let bold_id = system
+            .font_id(&font(".GPUIEmbeddedFont.weight-700"))
+            .unwrap();
+        let mut medium = font("Waypath CSS Weight");
+        medium.weight = FontWeight::MEDIUM;
+        let medium_id = system.font_id(&medium).unwrap();
+        let medium_layout = system.layout_line(
+            "A",
+            Pixels::from(32.0),
+            &[FontRun {
+                len: 1,
+                font_id: medium_id,
+                letter_spacing: Pixels::ZERO,
+            }],
+        );
+        assert_eq!(medium_layout.runs[0].font_id, regular_id);
+
+        let mut semibold = font("Waypath CSS Weight");
+        semibold.weight = FontWeight::SEMIBOLD;
+        let semibold_id = system.font_id(&semibold).unwrap();
+        let semibold_layout = system.layout_line(
+            "A",
+            Pixels::from(32.0),
+            &[FontRun {
+                len: 1,
+                font_id: semibold_id,
+                letter_spacing: Pixels::ZERO,
+            }],
+        );
+        assert_eq!(semibold_layout.runs[0].font_id, bold_id);
+
+        let mut italic = font("Waypath CSS Weight");
+        italic.style = FontStyle::Italic;
+        assert!(
+            system.font_id(&italic).is_err(),
+            "registered CSS families must not fall through to installed/system fonts"
+        );
     }
 
     fn layout_with_spacing(
