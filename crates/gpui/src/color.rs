@@ -781,9 +781,8 @@ pub struct Background {
     pub(crate) color_space: ColorSpace,
     pub(crate) solid: Hsla,
     pub(crate) gradient_angle_or_pattern_height: f32,
-    pub(crate) colors: [LinearColorStop; 2],
-    /// Padding for alignment for repr(C) layout.
-    pad: u32,
+    pub(crate) colors: [LinearColorStop; MAX_LINEAR_GRADIENT_STOPS],
+    pub(crate) stop_count: u32,
 }
 
 impl std::fmt::Debug for Background {
@@ -792,8 +791,9 @@ impl std::fmt::Debug for Background {
             BackgroundTag::Solid => write!(f, "Solid({:?})", self.solid),
             BackgroundTag::LinearGradient => write!(
                 f,
-                "LinearGradient({}, {:?}, {:?})",
-                self.gradient_angle_or_pattern_height, self.colors[0], self.colors[1]
+                "LinearGradient({}, {:?})",
+                self.gradient_angle_or_pattern_height,
+                &self.colors[..(self.stop_count as usize).min(MAX_LINEAR_GRADIENT_STOPS)]
             ),
             BackgroundTag::PatternSlash => write!(
                 f,
@@ -817,8 +817,8 @@ impl Default for Background {
             solid: Hsla::default(),
             color_space: ColorSpace::default(),
             gradient_angle_or_pattern_height: 0.0,
-            colors: [LinearColorStop::default(), LinearColorStop::default()],
-            pad: 0,
+            colors: [LinearColorStop::default(); MAX_LINEAR_GRADIENT_STOPS],
+            stop_count: 0,
         }
     }
 }
@@ -867,12 +867,41 @@ pub fn linear_gradient(
     from: impl Into<LinearColorStop>,
     to: impl Into<LinearColorStop>,
 ) -> Background {
-    Background {
+    try_linear_gradient_stops(angle, &[from.into(), to.into()])
+        .expect("a two-stop linear gradient always fits the native representation")
+}
+
+/// The largest linear-gradient stop list represented by GPUI's native scene
+/// and shader ABI. The locked Waypath design uses at most five stops.
+pub const MAX_LINEAR_GRADIENT_STOPS: usize = 5;
+
+/// Creates a linear-gradient background from an ordered list of color stops.
+///
+/// Returns `None` for fewer than two stops or more than
+/// [`MAX_LINEAR_GRADIENT_STOPS`]. Callers can therefore remain fail-closed
+/// instead of silently dropping or approximating stops.
+pub fn try_linear_gradient_stops(angle: f32, stops: &[LinearColorStop]) -> Option<Background> {
+    if !angle.is_finite()
+        || !(2..=MAX_LINEAR_GRADIENT_STOPS).contains(&stops.len())
+        || stops
+            .iter()
+            .any(|stop| !stop.percentage.is_finite() || !(0.0..=1.0).contains(&stop.percentage))
+        || stops
+            .windows(2)
+            .any(|pair| pair[0].percentage > pair[1].percentage)
+    {
+        return None;
+    }
+
+    let mut colors = [LinearColorStop::default(); MAX_LINEAR_GRADIENT_STOPS];
+    colors[..stops.len()].copy_from_slice(stops);
+    Some(Background {
         tag: BackgroundTag::LinearGradient,
         gradient_angle_or_pattern_height: angle,
-        colors: [from.into(), to.into()],
+        colors,
+        stop_count: stops.len() as u32,
         ..Default::default()
-    }
+    })
 }
 
 /// A color stop in a linear gradient.
@@ -929,10 +958,9 @@ impl Background {
     pub fn opacity(&self, factor: f32) -> Self {
         let mut background = *self;
         background.solid = background.solid.opacity(factor);
-        background.colors = [
-            self.colors[0].opacity(factor),
-            self.colors[1].opacity(factor),
-        ];
+        for (target, source) in background.colors.iter_mut().zip(self.colors) {
+            *target = source.opacity(factor);
+        }
         background
     }
 
@@ -940,7 +968,10 @@ impl Background {
     pub fn is_transparent(&self) -> bool {
         match self.tag {
             BackgroundTag::Solid => self.solid.is_transparent(),
-            BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
+            BackgroundTag::LinearGradient => self.colors
+                [..(self.stop_count as usize).min(MAX_LINEAR_GRADIENT_STOPS)]
+                .iter()
+                .all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
         }
@@ -1034,6 +1065,7 @@ mod tests {
         let to = linear_color_stop(rgba(0x00ff99ff), 1.0);
         let background = linear_gradient(90.0, from, to);
         assert_eq!(background.tag, BackgroundTag::LinearGradient);
+        assert_eq!(background.stop_count, 2);
         assert_eq!(background.colors[0], from);
         assert_eq!(background.colors[1], to);
 
@@ -1041,6 +1073,28 @@ mod tests {
         assert_eq!(background.opacity(0.5).colors[1], to.opacity(0.5));
         assert!(!background.is_transparent());
         assert!(background.opacity(0.0).is_transparent());
+    }
+
+    #[test]
+    fn test_background_multi_stop_linear_gradient() {
+        let stops = [
+            linear_color_stop(rgba(0x000000ff), 0.0),
+            linear_color_stop(rgba(0xff0000ff), 0.2),
+            linear_color_stop(rgba(0x00ff00ff), 0.3),
+            linear_color_stop(rgba(0x0000ffff), 0.5),
+            linear_color_stop(rgba(0xffffffff), 1.0),
+        ];
+        let background = try_linear_gradient_stops(90.0, &stops).unwrap();
+        assert_eq!(background.tag, BackgroundTag::LinearGradient);
+        assert_eq!(background.stop_count, 5);
+        assert_eq!(&background.colors, &stops);
+        assert!(try_linear_gradient_stops(90.0, &stops[..1]).is_none());
+
+        let mut too_many = stops.to_vec();
+        too_many.push(linear_color_stop(rgba(0xffffffff), 1.0));
+        assert!(try_linear_gradient_stops(90.0, &too_many).is_none());
+        assert!(try_linear_gradient_stops(90.0, &[stops[1], stops[0]]).is_none());
+        assert!(try_linear_gradient_stops(f32::NAN, &stops).is_none());
     }
 
     #[test]

@@ -58,8 +58,8 @@ struct Background {
     uint color_space;
     Hsla solid;
     float gradient_angle_or_pattern_height;
-    LinearColorStop colors[2];
-    uint pad;
+    LinearColorStop colors[5];
+    uint stop_count;
 };
 
 struct GradientColor {
@@ -309,7 +309,7 @@ float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
     return quad_sdf_impl(corner_center_to_point, corner_radius);
 }
 
-GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
+GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[5]) {
     GradientColor output;
     if (tag == 0 || tag == 2 || tag == 3) {
         output.solid = hsla_to_rgba(solid);
@@ -370,18 +370,35 @@ float4 gradient_color(Background background,
                 t = (t + half_size.y) / bounds.size.y;
             }
 
-            // Adjust t based on the stop percentages
-            t = (t - background.colors[0].percentage)
-                / (background.colors[1].percentage
-                - background.colors[0].percentage);
-            t = clamp(t, 0.0, 1.0);
+            // Select the source-defined stop interval. `>=` intentionally
+            // advances across duplicate offsets so hard stops choose the
+            // color on the right at the exact boundary, matching CSS.
+            uint stop_count = clamp(background.stop_count, 2u, 5u);
+            uint stop_index = 0u;
+            [unroll]
+            for (uint i = 1u; i < 5u; i++) {
+                if (i < stop_count && t >= background.colors[i].percentage) {
+                    stop_index = i;
+                }
+            }
+            stop_index = min(stop_index, stop_count - 2u);
+
+            float start = background.colors[stop_index].percentage;
+            float end = background.colors[stop_index + 1u].percentage;
+            float interval_t = end > start
+                ? clamp((t - start) / (end - start), 0.0, 1.0)
+                : (t < end ? 0.0 : 1.0);
+            float4 interval_color0 = hsla_to_rgba(background.colors[stop_index].color);
+            float4 interval_color1 = hsla_to_rgba(background.colors[stop_index + 1u].color);
 
             switch (background.color_space) {
                 case 0:
-                    color = lerp(color0, color1, t);
+                    color = lerp(interval_color0, interval_color1, interval_t);
                     break;
                 case 1: {
-                    float4 oklab_color = lerp(color0, color1, t);
+                    interval_color0 = srgb_to_oklab(interval_color0);
+                    interval_color1 = srgb_to_oklab(interval_color1);
+                    float4 oklab_color = lerp(interval_color0, interval_color1, interval_t);
                     color = oklab_to_srgb(oklab_color);
                     break;
                 }

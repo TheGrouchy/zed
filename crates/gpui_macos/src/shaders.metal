@@ -1252,18 +1252,33 @@ float4 fill_color(Background background,
           t = (t + half_size.y) / bounds.size.height;
       }
 
-      // Adjust t based on the stop percentages
-      t = (t - background.colors[0].percentage)
-        / (background.colors[1].percentage
-        - background.colors[0].percentage);
-      t = clamp(t, 0.0, 1.0);
+      // Select the source-defined interval. Advancing on equality is
+      // required for CSS hard stops with duplicate offsets.
+      uint stop_count = clamp(background.stop_count, 2u, 5u);
+      uint stop_index = 0u;
+      for (uint i = 1u; i < 5u; i++) {
+        if (i < stop_count && t >= background.colors[i].percentage) {
+          stop_index = i;
+        }
+      }
+      stop_index = min(stop_index, stop_count - 2u);
+
+      float start = background.colors[stop_index].percentage;
+      float end = background.colors[stop_index + 1u].percentage;
+      float interval_t = end > start
+        ? clamp((t - start) / (end - start), 0.0, 1.0)
+        : (t < end ? 0.0 : 1.0);
+      float4 interval_color0 = hsla_to_rgba(background.colors[stop_index].color);
+      float4 interval_color1 = hsla_to_rgba(background.colors[stop_index + 1u].color);
 
       switch (background.color_space) {
         case 0:
-          color = mix(color0, color1, t);
+          color = mix(interval_color0, interval_color1, interval_t);
           break;
         case 1: {
-          float4 oklab_color = mix(color0, color1, t);
+          interval_color0 = srgb_to_oklab(interval_color0);
+          interval_color1 = srgb_to_oklab(interval_color1);
+          float4 oklab_color = mix(interval_color0, interval_color1, interval_t);
           color = oklab_to_srgb(oklab_color);
           break;
         }
