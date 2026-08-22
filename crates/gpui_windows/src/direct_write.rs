@@ -32,6 +32,7 @@ struct FontInfo {
     font_face: IDWriteFontFace3,
     requested_weight: DWRITE_FONT_WEIGHT,
     requested_style: DWRITE_FONT_STYLE,
+    requested_weight_axis: Option<DWRITE_FONT_AXIS_VALUE>,
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
@@ -676,6 +677,14 @@ impl DirectWriteState {
             let res = maybe!({
                 let font_face_ref = unsafe { font.GetFontFaceReference(index).log_err()? };
                 let font_face = unsafe { font_face_ref.CreateFontFace().log_err()? };
+                let requested_weight_axis = font_face
+                    .cast::<IDWriteFontFace5>()
+                    .ok()
+                    .filter(|font_face| unsafe { font_face.HasVariations().as_bool() })
+                    .map(|_| DWRITE_FONT_AXIS_VALUE {
+                        axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
+                        value: weight.0,
+                    });
                 let direct_write_features =
                     unsafe { Self::generate_font_features(factory, features).log_err()? };
                 let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
@@ -693,6 +702,7 @@ impl DirectWriteState {
                     font_face,
                     requested_weight: font_weight_to_dwrite(weight),
                     requested_style: font_style_to_dwrite(style),
+                    requested_weight_axis,
                     features: direct_write_features,
                     fallbacks,
                     font_collection: collection.clone(),
@@ -742,6 +752,10 @@ impl DirectWriteState {
                         &components.locale,
                     )?
                     .cast()?;
+                if let Some(weight_axis) = font_info.requested_weight_axis {
+                    let format: IDWriteTextFormat3 = format.cast()?;
+                    format.SetFontAxisValues(&[weight_axis])?;
+                }
                 if let Some(ref fallbacks) = font_info.fallbacks {
                     format.SetFontFallback(fallbacks)?;
                 }
@@ -764,6 +778,10 @@ impl DirectWriteState {
                     0.0,
                     text_range,
                 )?;
+                if let Some(weight_axis) = font_info.requested_weight_axis {
+                    let axis_layout: IDWriteTextLayout4 = layout.cast()?;
+                    axis_layout.SetFontAxisValues(&[weight_axis], text_range)?;
+                }
                 utf16_offset += current_text_utf16_length;
 
                 layout
@@ -801,6 +819,10 @@ impl DirectWriteState {
                 text_layout.SetFontSize(font_size, text_range)?;
                 text_layout.SetFontStyle(font_info.requested_style, text_range)?;
                 text_layout.SetFontWeight(font_info.requested_weight, text_range)?;
+                if let Some(weight_axis) = font_info.requested_weight_axis {
+                    let axis_layout: IDWriteTextLayout4 = text_layout.cast()?;
+                    axis_layout.SetFontAxisValues(&[weight_axis], text_range)?;
+                }
                 text_layout.SetTypography(&font_info.features, text_range)?;
                 text_layout.SetCharacterSpacing(
                     0.0,
