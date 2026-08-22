@@ -80,6 +80,9 @@ struct DirectXResources {
     linear_mask_group_texture: ID3D11Texture2D,
     linear_mask_group_srv: Option<ID3D11ShaderResourceView>,
     linear_mask_group_view: Option<ID3D11RenderTargetView>,
+    text_shadow_blur_texture: ID3D11Texture2D,
+    text_shadow_blur_srv: Option<ID3D11ShaderResourceView>,
+    text_shadow_blur_view: Option<ID3D11RenderTargetView>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -91,6 +94,8 @@ struct DirectXRenderPipelines {
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     linear_mask_group_pipeline: PipelineState<LinearGradientMaskParams>,
+    text_shadow_blur_pipeline: PipelineState<ScaledTextShadow>,
+    text_shadow_composite_pipeline: PipelineState<ScaledTextShadow>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
@@ -371,6 +376,14 @@ impl DirectXRenderer {
                     let paths = &scene.paths[range];
                     self.draw_paths_to_intermediate(paths, target_view)?;
                     self.draw_paths_from_intermediate(paths)
+                }
+                PrimitiveBatch::TextShadowGroup(index) => {
+                    self.draw_text_shadow_group(
+                        &scene.text_shadow_groups[index],
+                        target_view,
+                        annotation,
+                    )?;
+                    self.upload_scene_buffers(scene)
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -719,6 +732,101 @@ impl DirectXRenderer {
         )
     }
 
+    fn draw_text_shadow_group(
+        &mut self,
+        group: &TextShadowGroup,
+        parent_target: &Option<ID3D11RenderTargetView>,
+        annotation: Option<&ID3DUserDefinedAnnotation>,
+    ) -> Result<()> {
+        let (source_view, source_srv, blur_view, blur_srv) = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            (
+                resources.linear_mask_group_view.clone(),
+                resources.linear_mask_group_srv.clone(),
+                resources.text_shadow_blur_view.clone(),
+                resources.text_shadow_blur_srv.clone(),
+            )
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        unsafe {
+            devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
+            devices.device_context.ClearRenderTargetView(
+                source_view
+                    .as_ref()
+                    .context("missing text shadow source view")?,
+                &[0.0; 4],
+            );
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&source_view)), None);
+        }
+        self.upload_scene_buffers(&group.shadow_scene)?;
+        self.draw_scene_batches(&group.shadow_scene, &source_view, annotation)?;
+
+        for shadow in group.shadows.iter().rev() {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            unsafe {
+                devices
+                    .device_context
+                    .PSSetShaderResources(0, Some(&[None]));
+                devices.device_context.ClearRenderTargetView(
+                    blur_view
+                        .as_ref()
+                        .context("missing text shadow blur view")?,
+                    &[0.0; 4],
+                );
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&blur_view)), None);
+            }
+            self.pipelines.text_shadow_blur_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                slice::from_ref(shadow),
+            )?;
+            let resources = self.resources.as_ref().context("resources missing")?;
+            self.pipelines.text_shadow_blur_pipeline.draw_with_texture(
+                &devices.device_context,
+                slice::from_ref(&source_srv),
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                1,
+            )?;
+
+            unsafe {
+                devices
+                    .device_context
+                    .PSSetShaderResources(0, Some(&[None]));
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(parent_target)), None);
+            }
+            self.pipelines
+                .text_shadow_composite_pipeline
+                .update_buffer(
+                    &devices.device,
+                    &devices.device_context,
+                    slice::from_ref(shadow),
+                )?;
+            self.pipelines
+                .text_shadow_composite_pipeline
+                .draw_with_texture(
+                    &devices.device_context,
+                    slice::from_ref(&blur_srv),
+                    slice::from_ref(&resources.viewport),
+                    slice::from_ref(&self.globals.global_params_buffer),
+                    slice::from_ref(&self.globals.sampler),
+                    1,
+                )?;
+        }
+
+        self.upload_scene_buffers(&group.scene)?;
+        self.draw_scene_batches(&group.scene, parent_target, annotation)
+    }
+
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
         if len == 0 {
             return Ok(());
@@ -895,6 +1003,8 @@ impl DirectXResources {
         ) = create_resources(devices, &swap_chain, width, height)?;
         let (linear_mask_group_texture, linear_mask_group_srv, linear_mask_group_view) =
             create_linear_mask_group_texture(&devices.device, width, height)?;
+        let (text_shadow_blur_texture, text_shadow_blur_srv, text_shadow_blur_view) =
+            create_linear_mask_group_texture(&devices.device, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
@@ -908,6 +1018,9 @@ impl DirectXResources {
             linear_mask_group_texture,
             linear_mask_group_srv,
             linear_mask_group_view,
+            text_shadow_blur_texture,
+            text_shadow_blur_srv,
+            text_shadow_blur_view,
             viewport,
         })
     }
@@ -930,6 +1043,8 @@ impl DirectXResources {
         ) = create_resources(devices, &self.swap_chain, width, height)?;
         let (linear_mask_group_texture, linear_mask_group_srv, linear_mask_group_view) =
             create_linear_mask_group_texture(&devices.device, width, height)?;
+        let (text_shadow_blur_texture, text_shadow_blur_srv, text_shadow_blur_view) =
+            create_linear_mask_group_texture(&devices.device, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.path_intermediate_texture = path_intermediate_texture;
@@ -939,6 +1054,9 @@ impl DirectXResources {
         self.linear_mask_group_texture = linear_mask_group_texture;
         self.linear_mask_group_srv = linear_mask_group_srv;
         self.linear_mask_group_view = linear_mask_group_view;
+        self.text_shadow_blur_texture = text_shadow_blur_texture;
+        self.text_shadow_blur_srv = text_shadow_blur_srv;
+        self.text_shadow_blur_view = text_shadow_blur_view;
         self.viewport = viewport;
         Ok(())
     }
@@ -981,6 +1099,20 @@ impl DirectXRenderPipelines {
             1,
             create_blend_state_for_path_rasterization(device)?,
         )?;
+        let text_shadow_blur_pipeline = PipelineState::new(
+            device,
+            "text_shadow_blur_pipeline",
+            ShaderModule::TextShadowBlur,
+            1,
+            create_blend_state_disabled(device)?,
+        )?;
+        let text_shadow_composite_pipeline = PipelineState::new(
+            device,
+            "text_shadow_composite_pipeline",
+            ShaderModule::TextShadowComposite,
+            1,
+            create_blend_state(device)?,
+        )?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
@@ -1016,6 +1148,8 @@ impl DirectXRenderPipelines {
             path_rasterization_pipeline,
             path_sprite_pipeline,
             linear_mask_group_pipeline,
+            text_shadow_blur_pipeline,
+            text_shadow_composite_pipeline,
             underline_pipeline,
             mono_sprites,
             subpixel_sprites,
@@ -1545,6 +1679,18 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
 }
 
 #[inline]
+fn create_blend_state_disabled(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = false.into();
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
 fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
@@ -1748,6 +1894,8 @@ pub(crate) mod shader_resources {
         PathRasterization,
         PathSprite,
         LinearGradientMaskGroup,
+        TextShadowBlur,
+        TextShadowComposite,
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
@@ -1816,6 +1964,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::LinearGradientMaskGroup => match target {
                     ShaderTarget::Vertex => LINEAR_GRADIENT_MASK_GROUP_VERTEX_BYTES,
                     ShaderTarget::Fragment => LINEAR_GRADIENT_MASK_GROUP_FRAGMENT_BYTES,
+                },
+                ShaderModule::TextShadowBlur => match target {
+                    ShaderTarget::Vertex => TEXT_SHADOW_BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => TEXT_SHADOW_BLUR_FRAGMENT_BYTES,
+                },
+                ShaderModule::TextShadowComposite => match target {
+                    ShaderTarget::Vertex => TEXT_SHADOW_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => TEXT_SHADOW_COMPOSITE_FRAGMENT_BYTES,
                 },
                 ShaderModule::MonochromeSprite => match target {
                     ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
@@ -1917,6 +2073,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::PathRasterization => "path_rasterization",
                 ShaderModule::PathSprite => "path_sprite",
                 ShaderModule::LinearGradientMaskGroup => "linear_gradient_mask_group",
+                ShaderModule::TextShadowBlur => "text_shadow_blur",
+                ShaderModule::TextShadowComposite => "text_shadow_composite",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
@@ -1946,6 +2104,19 @@ pub(crate) mod shader_resources {
                 ShaderTarget::Fragment,
             )
             .expect("mask group fragment shader must compile");
+        }
+
+        #[test]
+        fn text_shadow_shaders_compile_with_fxc() {
+            for module in [
+                ShaderModule::TextShadowBlur,
+                ShaderModule::TextShadowComposite,
+            ] {
+                build_shader_blob(module, ShaderTarget::Vertex)
+                    .expect("text-shadow vertex shader must compile");
+                build_shader_blob(module, ShaderTarget::Fragment)
+                    .expect("text-shadow fragment shader must compile");
+            }
         }
     }
 }

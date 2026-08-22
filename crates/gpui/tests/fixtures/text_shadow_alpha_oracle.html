@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  html, body {
+    width: 640px;
+    height: 96px;
+    margin: 0;
+    overflow: hidden;
+    background: transparent;
+  }
+  .cell {
+    position: absolute;
+    top: 0;
+    width: 128px;
+    height: 96px;
+    color: transparent;
+    font: 400 48px/96px Arial, sans-serif;
+    text-align: center;
+  }
+  /* Non-zero but below Skia's no-blur threshold: this forces Chromium's
+     shadow-mask path while preserving the source A8 coverage unchanged. */
+  #hard { left: 0; text-shadow: 0 0 0.01px white; }
+  #blur3 { left: 128px; text-shadow: 0 0 3px white; }
+  #blur4 { left: 256px; text-shadow: 0 0 4px white; }
+  #blur9 { left: 384px; text-shadow: 0 0 9px white; }
+  #locked {
+    left: 512px;
+    text-shadow: 0 0 4px #0a0a0a, 0 0 9px #0a0a0a, 0 1px 3px #0a0a0a;
+  }
+</style>
+<div class="cell" id="hard">H</div>
+<div class="cell" id="blur3">H</div>
+<div class="cell" id="blur4">H</div>
+<div class="cell" id="blur9">H</div>
+<div class="cell" id="locked">H</div>

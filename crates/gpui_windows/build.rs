@@ -35,6 +35,8 @@ mod shader_compilation {
             "path_rasterization",
             "path_sprite",
             "linear_gradient_mask_group",
+            "text_shadow_blur",
+            "text_shadow_composite",
             "underline",
             "monochrome_sprite",
             "subpixel_sprite",

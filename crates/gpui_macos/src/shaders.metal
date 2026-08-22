@@ -76,6 +76,203 @@ fragment float4 linear_gradient_mask_group_fragment(
   return flattened_group_pixel * mask_alpha;
 }
 
+constant uint TEXT_SHADOW_KERNEL_CAPACITY = 64u;
+
+struct TextShadowBlurVertexOutput {
+  uint shadow_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex TextShadowBlurVertexOutput text_shadow_blur_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    uint shadow_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(TextShadowInputIndex_Vertices)]],
+    constant ScaledTextShadow *shadows [[buffer(TextShadowInputIndex_Shadows)]],
+    constant Size_DevicePixels *viewport_size [[buffer(TextShadowInputIndex_ViewportSize)]]) {
+  return TextShadowBlurVertexOutput{
+      shadow_id,
+      to_device_position(unit_vertices[unit_vertex_id],
+                         shadows[shadow_id].first_pass_bounds, viewport_size),
+  };
+}
+
+float text_shadow_source_alpha(float2 position,
+                               texture2d<float> source,
+                               constant Size_DevicePixels *viewport_size) {
+  float2 size = float2(viewport_size->width, viewport_size->height);
+  if (position.x < 0.0 || position.y < 0.0 ||
+      position.x >= size.x || position.y >= size.y) {
+    return 0.0;
+  }
+  return source.read(uint2(floor(position))).a;
+}
+
+float quantize_text_shadow_alpha(float alpha) {
+  return floor(saturate(alpha) * 255.0 + 0.5) / 255.0;
+}
+
+float text_shadow_accumulator_start(float blur_radius) {
+  return blur_radius < 4.0 ? 128.0 : 0.0;
+}
+
+float text_shadow_weighted_alpha(float alpha, float weight, float blur_radius) {
+  if (blur_radius < 4.0) {
+    float source_a8 = floor(saturate(alpha) * 255.0 + 0.5);
+    return floor(source_a8 * 256.0 * weight);
+  }
+  return alpha * weight;
+}
+
+float finish_text_shadow_alpha(float alpha, float blur_radius) {
+  if (blur_radius < 4.0) {
+    return floor(alpha / 256.0) / 255.0;
+  }
+  return quantize_text_shadow_alpha(alpha);
+}
+
+uint text_shadow_source_a8(float alpha) {
+  return uint(floor(saturate(alpha) * 255.0 + 0.5));
+}
+
+uint rounded_multiply_high_u32(uint lhs, uint rhs) {
+  uint lhs_low = lhs & 0xffffu;
+  uint lhs_high = lhs >> 16u;
+  uint rhs_low = rhs & 0xffffu;
+  uint rhs_high = rhs >> 16u;
+  uint product_low = lhs_low * rhs_low;
+  uint product_cross0 = lhs_high * rhs_low;
+  uint product_cross1 = lhs_low * rhs_high;
+  uint middle = (product_low >> 16u) + (product_cross0 & 0xffffu) +
+                (product_cross1 & 0xffffu) + 0x8000u;
+  return lhs_high * rhs_high + (product_cross0 >> 16u) +
+         (product_cross1 >> 16u) + (middle >> 16u);
+}
+
+fragment float4 text_shadow_blur_fragment(
+    TextShadowBlurVertexOutput input [[stage_in]],
+    constant ScaledTextShadow *shadows [[buffer(TextShadowInputIndex_Shadows)]],
+    constant Size_DevicePixels *viewport_size [[buffer(TextShadowInputIndex_ViewportSize)]],
+    texture2d<float> source [[texture(TextShadowInputIndex_SourceTexture)]]) {
+  ScaledTextShadow shadow = shadows[input.shadow_id];
+  float alpha;
+  if (shadow.blur_radius < 4.0) {
+    alpha = text_shadow_accumulator_start(shadow.blur_radius);
+    alpha += text_shadow_weighted_alpha(
+        text_shadow_source_alpha(input.position.xy, source, viewport_size),
+        shadow.kernel[0], shadow.blur_radius);
+    for (uint distance = 1u; distance < TEXT_SHADOW_KERNEL_CAPACITY; distance += 1u) {
+      if (distance > shadow.kernel_radius) break;
+      float2 delta = float2(0.0, float(distance));
+      alpha += text_shadow_weighted_alpha(
+          text_shadow_source_alpha(input.position.xy - delta, source, viewport_size),
+          shadow.kernel[distance], shadow.blur_radius);
+      alpha += text_shadow_weighted_alpha(
+          text_shadow_source_alpha(input.position.xy + delta, source, viewport_size),
+          shadow.kernel[distance], shadow.blur_radius);
+    }
+    alpha = finish_text_shadow_alpha(alpha, shadow.blur_radius);
+  } else {
+    uint sum = text_shadow_source_a8(
+        text_shadow_source_alpha(input.position.xy, source, viewport_size)) *
+        uint(shadow.kernel[0]);
+    for (uint distance = 1u; distance < TEXT_SHADOW_KERNEL_CAPACITY; distance += 1u) {
+      if (distance > shadow.kernel_radius) break;
+      float2 delta = float2(float(distance), 0.0);
+      uint coefficient = uint(shadow.kernel[distance]);
+      sum += text_shadow_source_a8(
+          text_shadow_source_alpha(input.position.xy - delta, source, viewport_size)) * coefficient;
+      sum += text_shadow_source_a8(
+          text_shadow_source_alpha(input.position.xy + delta, source, viewport_size)) * coefficient;
+    }
+    alpha = float(rounded_multiply_high_u32(sum, shadow.normalization_weight)) / 255.0;
+  }
+  return float4(alpha);
+}
+
+struct TextShadowCompositeVertexOutput {
+  uint shadow_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct TextShadowCompositeFragmentInput {
+  uint shadow_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex TextShadowCompositeVertexOutput text_shadow_composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    uint shadow_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(TextShadowInputIndex_Vertices)]],
+    constant ScaledTextShadow *shadows [[buffer(TextShadowInputIndex_Shadows)]],
+    constant Size_DevicePixels *viewport_size [[buffer(TextShadowInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  ScaledTextShadow shadow = shadows[shadow_id];
+  float4 clip_distance = distance_from_clip_rect(
+      unit_vertex, shadow.final_bounds, shadow.content_mask);
+  return TextShadowCompositeVertexOutput{
+      shadow_id,
+      to_device_position(unit_vertex, shadow.final_bounds, viewport_size),
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+  };
+}
+
+float text_shadow_horizontal_alpha(float2 position,
+                                   texture2d<float> source,
+                                   constant Size_DevicePixels *viewport_size) {
+  float2 size = float2(viewport_size->width, viewport_size->height);
+  if (position.x < 0.0 || position.y < 0.0 ||
+      position.x >= size.x || position.y >= size.y) {
+    return 0.0;
+  }
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  return source.sample(texture_sampler, position / size).a;
+}
+
+fragment float4 text_shadow_composite_fragment(
+    TextShadowCompositeFragmentInput input [[stage_in]],
+    constant ScaledTextShadow *shadows [[buffer(TextShadowInputIndex_Shadows)]],
+    constant Size_DevicePixels *viewport_size [[buffer(TextShadowInputIndex_ViewportSize)]],
+    texture2d<float> source [[texture(TextShadowInputIndex_SourceTexture)]]) {
+  ScaledTextShadow shadow = shadows[input.shadow_id];
+  float2 source_position = input.position.xy - shadow.offset;
+  float alpha;
+  if (shadow.blur_radius < 4.0) {
+    alpha = text_shadow_accumulator_start(shadow.blur_radius);
+    alpha += text_shadow_weighted_alpha(
+        text_shadow_horizontal_alpha(source_position, source, viewport_size),
+        shadow.kernel[0], shadow.blur_radius);
+    for (uint distance = 1u; distance < TEXT_SHADOW_KERNEL_CAPACITY; distance += 1u) {
+      if (distance > shadow.kernel_radius) break;
+      float2 delta = float2(float(distance), 0.0);
+      alpha += text_shadow_weighted_alpha(
+          text_shadow_horizontal_alpha(source_position - delta, source, viewport_size),
+          shadow.kernel[distance], shadow.blur_radius);
+      alpha += text_shadow_weighted_alpha(
+          text_shadow_horizontal_alpha(source_position + delta, source, viewport_size),
+          shadow.kernel[distance], shadow.blur_radius);
+    }
+    alpha = finish_text_shadow_alpha(alpha, shadow.blur_radius);
+  } else {
+    uint sum = text_shadow_source_a8(
+        text_shadow_horizontal_alpha(source_position, source, viewport_size)) *
+        uint(shadow.kernel[0]);
+    for (uint distance = 1u; distance < TEXT_SHADOW_KERNEL_CAPACITY; distance += 1u) {
+      if (distance > shadow.kernel_radius) break;
+      float2 delta = float2(0.0, float(distance));
+      uint coefficient = uint(shadow.kernel[distance]);
+      sum += text_shadow_source_a8(
+          text_shadow_horizontal_alpha(source_position - delta, source, viewport_size)) * coefficient;
+      sum += text_shadow_source_a8(
+          text_shadow_horizontal_alpha(source_position + delta, source, viewport_size)) * coefficient;
+    }
+    alpha = float(rounded_multiply_high_u32(sum, shadow.normalization_weight)) / 255.0;
+  }
+  float4 color = hsla_to_rgba(shadow.color);
+  color.a *= alpha;
+  return color;
+}
+
 struct QuadVertexOutput {
   uint quad_id [[flat]];
   float4 position [[position]];

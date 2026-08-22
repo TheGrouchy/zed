@@ -60,6 +60,8 @@ mod macos_build {
             "LinearGradientMaskParams".into(),
             "LinearGradientMaskGroupInputIndex".into(),
             "ScaledLinearGradientMaskStop".into(),
+            "ScaledTextShadow".into(),
+            "TextShadowInputIndex".into(),
             "BorderStyle".into(),
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),

@@ -15,10 +15,11 @@ use crate::{
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, profiler, px, rems, size, transparent_black,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextShadow, TextShadowGroupError, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
+    transparent_black, white,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -3634,8 +3635,7 @@ impl Window {
         let band = fade.band.0.max(1.0);
         let mut ramp: f32 = 1.0;
         if fade.top {
-            ramp = ramp
-                .min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
+            ramp = ramp.min(((center.y.0 - fade.bounds.top().0) / fade.top_band()).clamp(0.0, 1.0));
         }
         if fade.bottom {
             ramp = ramp
@@ -3674,8 +3674,7 @@ impl Window {
         }
         if fade.bottom {
             ramp = ramp.min(
-                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band())
-                    .clamp(0.0, 1.0),
+                ((fade.bounds.bottom().0 - bounds.bottom().0) / fade.bottom_band()).clamp(0.0, 1.0),
             );
         }
         if fade.left {
@@ -3987,6 +3986,36 @@ impl Window {
             .push_linear_gradient_mask_group(mask.scale(self.scale_factor()))?;
         let result = f(self);
         self.next_frame.scene.pop_linear_gradient_mask_group()?;
+        Ok(result)
+    }
+
+    /// Paints text atomically with a native CSS text-shadow list. The source
+    /// glyphs retain their normal platform rendering; a separate grayscale
+    /// coverage group feeds the renderer's discrete blur passes.
+    pub fn paint_text_shadow_group<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        shadows: &[TextShadow],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, TextShadowGroupError> {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity_for_bounds(&bounds);
+        let shadows = shadows
+            .iter()
+            .copied()
+            .map(|mut shadow| {
+                shadow.color = shadow.color.opacity(opacity);
+                shadow
+            })
+            .collect();
+        self.next_frame.scene.push_text_shadow_group(
+            self.cover_bounds(bounds),
+            self.snapped_content_mask(),
+            self.scale_factor(),
+            shadows,
+        )?;
+        let result = f(self);
+        self.next_frame.scene.pop_text_shadow_group()?;
         Ok(result)
     }
 
@@ -4357,6 +4386,37 @@ impl Window {
             dilation,
         };
 
+        let shadow_source = if self.next_frame.scene.has_active_text_shadow_group() {
+            let mut shadow_params = params.clone();
+            shadow_params.subpixel_rendering = false;
+            let shadow_raster_bounds = self.text_system().raster_bounds(&shadow_params)?;
+            if shadow_raster_bounds.is_zero() {
+                None
+            } else {
+                let shadow_tile = self
+                    .sprite_atlas
+                    .get_or_insert_with(&shadow_params.clone().into(), &mut || {
+                        let (size, bytes) = self.text_system().rasterize_glyph(&shadow_params)?;
+                        Ok(Some((size, Cow::Owned(bytes))))
+                    })?
+                    .expect("Callback above only errors or returns Some");
+                Some(MonochromeSprite {
+                    order: 0,
+                    pad: 0,
+                    bounds: Bounds {
+                        origin: integer_origin + shadow_raster_bounds.origin.map(Into::into),
+                        size: shadow_tile.bounds.size.map(Into::into),
+                    },
+                    content_mask: self.snapped_content_mask(),
+                    color: white(),
+                    tile: shadow_tile,
+                    transformation: TransformationMatrix::unit(),
+                })
+            }
+        } else {
+            None
+        };
+
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
             let tile = self
@@ -4393,6 +4453,9 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             }
+        }
+        if let Some(sprite) = shadow_source {
+            self.next_frame.scene.insert_text_shadow_glyph(sprite);
         }
         Ok(())
     }
@@ -4440,6 +4503,9 @@ impl Window {
         self.next_frame
             .scene
             .mark_color_glyph_in_linear_gradient_mask_group();
+        self.next_frame
+            .scene
+            .mark_color_glyph_in_text_shadow_group();
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
@@ -6899,8 +6965,8 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use crate::{
-        AppContext as _, AtlasKey, AtlasTextureKind, Bounds, Context, FocusHandle, FontId,
-        GlyphId, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
+        AppContext as _, AtlasKey, AtlasTextureKind, Bounds, Context, FocusHandle, FontId, GlyphId,
+        InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
         RenderGlyphParams, Styled as _, TestAppContext, Window, canvas, div, point, px, size,
     };
     use std::{cell::Cell, rc::Rc};

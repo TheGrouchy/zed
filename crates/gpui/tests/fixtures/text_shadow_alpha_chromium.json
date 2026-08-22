@@ -1,0 +1,103 @@
+{
+  "oracle": "Chromium headless transparent PNG",
+  "chromiumVersion": "151.0.7922.170",
+  "deviceScaleFactor": 1,
+  "viewport": [
+    640,
+    96
+  ],
+  "cellSize": [
+    128,
+    96
+  ],
+  "font": "400 48px/96px Arial, sans-serif",
+  "lockedDeclarations": [
+    "0 0 4px #0a0a0a, 0 0 9px #0a0a0a",
+    "0 0 4px #0a0a0a, 0 0 9px #0a0a0a, 0 1px 3px #0a0a0a",
+    "0 0 2px var(--bg), 0 0 3px var(--bg), 0 0 5px var(--bg)",
+    "0 0 3px var(--bg), 0 0 5px var(--bg)",
+    "0 0 3px var(--bg), 0 0 7px var(--bg)"
+  ],
+  "lockedBackgrounds": [
+    "#E8E1D4",
+    "#E1E7EF",
+    "#E5E4E1",
+    "#1B1712",
+    "#14181E",
+    "#171716"
+  ],
+  "pngSha256": "28998C25F80B4FDB591FE70B642DDE652D490D37F0E3C7D6DAEF6E027EFB2033",
+  "alphaPlaneSha256": "2DBDC308E7666B72353AC3BD87096A7D410A20220F12D6DA7404A2FEA7C88F81",
+  "cells": {
+    "hard": {
+      "rgbaSha256": "835D390A1CC01095BFE77A1C7D7483C97B628B62C15EA98B5DCC8F460782BC92",
+      "alphaSha256": "A2239829FF9AE716069AF756F11F12B0C25642AC4C3CCF95D1A6A84D47E7513E",
+      "alphaSum": 99987,
+      "nonzeroPixels": 484,
+      "alphaBounds": [
+        50,
+        29,
+        78,
+        64
+      ],
+      "alphaOffset": 0,
+      "alphaLength": 12288
+    },
+    "blur3": {
+      "rgbaSha256": "277C5A260210DA5B97AE166479AC855B37621D81F28A1609DD228D2FE095B2D3",
+      "alphaSha256": "A32FA0E0BE1CD927C469B21C2C67F688117D9BD31B147B7AE5C0C879161CC9B4",
+      "alphaSum": 100019,
+      "nonzeroPixels": 1064,
+      "alphaBounds": [
+        47,
+        26,
+        81,
+        67
+      ],
+      "alphaOffset": 12288,
+      "alphaLength": 12288
+    },
+    "blur4": {
+      "rgbaSha256": "AE39D73BCC26A8D9156CEAFDFA5A75977CAECF5D37B7F10D93DD7A4D2904FB2E",
+      "alphaSha256": "CB5537617CDFD499036B22B82B742CA828AF086B67AF9561AC4CB5D556A28B2A",
+      "alphaSum": 99916,
+      "nonzeroPixels": 1435,
+      "alphaBounds": [
+        45,
+        24,
+        83,
+        69
+      ],
+      "alphaOffset": 24576,
+      "alphaLength": 12288
+    },
+    "blur9": {
+      "rgbaSha256": "597958508BDAA1E96BFB803EB4EABD6B8FB7FF204FB275A5EF607DD2F4B92EE1",
+      "alphaSha256": "14070F800245E3A834B237AE286934D6BED63D0B576A12EAC1247150BD7866E4",
+      "alphaSum": 99992,
+      "nonzeroPixels": 2468,
+      "alphaBounds": [
+        40,
+        19,
+        88,
+        74
+      ],
+      "alphaOffset": 36864,
+      "alphaLength": 12288
+    },
+    "locked": {
+      "rgbaSha256": "DCDACFB3A93B330575F1D1937717A069ED29A14D9B42FBA66FD0A4C4F280C004",
+      "alphaSha256": "4DFA64C9C4731A8E8D052446535A28091D48488B79D0DAD395ACEA040046F97E",
+      "alphaSum": 192015,
+      "nonzeroPixels": 2468,
+      "alphaBounds": [
+        40,
+        19,
+        88,
+        74
+      ],
+      "alphaOffset": 49152,
+      "alphaLength": 12288
+    }
+  }
+}

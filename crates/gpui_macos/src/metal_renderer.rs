@@ -9,7 +9,8 @@ use cocoa::{
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, DrawOrder,
     LinearGradientMaskParams, MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite,
-    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
+    PrimitiveBatch, Quad, ScaledPixels, ScaledTextShadow, Scene, Shadow, Size, Surface,
+    TextShadowGroup, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -156,6 +157,8 @@ pub(crate) struct MetalRenderer {
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
     linear_mask_group_pipeline_state: metal::RenderPipelineState,
+    text_shadow_blur_pipeline_state: metal::RenderPipelineState,
+    text_shadow_composite_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
     /// Framebuffer snapshot (blit dst / gaussian src) + the blurred result the
@@ -185,6 +188,7 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     linear_mask_group_texture: Option<metal::Texture>,
+    text_shadow_blur_texture: Option<metal::Texture>,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -343,6 +347,22 @@ impl MetalRenderer {
             "linear_gradient_mask_group_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let text_shadow_blur_pipeline_state = build_pipeline_state_no_blend(
+            &device,
+            &library,
+            "text_shadow_blur",
+            "text_shadow_blur_vertex",
+            "text_shadow_blur_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let text_shadow_composite_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "text_shadow_composite",
+            "text_shadow_composite_vertex",
+            "text_shadow_composite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let shadows_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -418,6 +438,8 @@ impl MetalRenderer {
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
             linear_mask_group_pipeline_state,
+            text_shadow_blur_pipeline_state,
+            text_shadow_composite_pipeline_state,
             shadows_pipeline_state,
             backdrop_blur_pipeline_state,
             backdrop_scratch: None,
@@ -438,6 +460,7 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             linear_mask_group_texture: None,
+            text_shadow_blur_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
@@ -484,6 +507,7 @@ impl MetalRenderer {
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
         self.linear_mask_group_texture = None;
+        self.text_shadow_blur_texture = None;
     }
 
     /// Create the drawable-sized path intermediates if missing or stale.
@@ -499,9 +523,13 @@ impl MetalRenderer {
             self.path_intermediate_msaa_texture = None;
             return;
         }
-        if self.path_intermediate_texture.as_ref().is_some_and(|texture| {
-            texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
-        }) {
+        if self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            })
+        {
             return;
         }
 
@@ -555,6 +583,31 @@ impl MetalRenderer {
         descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         self.linear_mask_group_texture = Some(self.device.new_texture(&descriptor));
+    }
+
+    fn ensure_text_shadow_textures(&mut self, size: Size<DevicePixels>) {
+        self.ensure_linear_mask_group_texture(size);
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.text_shadow_blur_texture = None;
+            return;
+        }
+        if self
+            .text_shadow_blur_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            })
+        {
+            return;
+        }
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        self.text_shadow_blur_texture = Some(self.device.new_texture(&descriptor));
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -983,6 +1036,9 @@ impl MetalRenderer {
         if !scene.linear_gradient_mask_groups.is_empty() {
             self.ensure_linear_mask_group_texture(viewport_size);
         }
+        if !scene.text_shadow_groups.is_empty() {
+            self.ensure_text_shadow_textures(viewport_size);
+        }
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -1194,6 +1250,7 @@ impl MetalRenderer {
                         viewport_size,
                         command_buffer,
                         &scratch,
+                        true,
                     );
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
@@ -1212,6 +1269,94 @@ impl MetalRenderer {
                             &scratch,
                             command_encoder,
                         )
+                }
+                PrimitiveBatch::TextShadowGroup(index) => {
+                    command_encoder.end_encoding();
+                    let group = &scene.text_shadow_groups[index];
+                    let Some(source) = self.linear_mask_group_texture.clone() else {
+                        anyhow::bail!("text-shadow source scratch texture is unavailable");
+                    };
+                    let Some(blur) = self.text_shadow_blur_texture.clone() else {
+                        anyhow::bail!("text-shadow blur scratch texture is unavailable");
+                    };
+                    let mut rendered = self.draw_flat_scene_to_texture(
+                        &group.shadow_scene,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_buffer,
+                        &source,
+                        true,
+                    );
+
+                    for shadow in group.shadows.iter().rev() {
+                        if !rendered {
+                            break;
+                        }
+                        let blur_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            &blur,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                                color_attachment
+                                    .set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+                            },
+                        );
+                        rendered = self.draw_text_shadow_pass(
+                            shadow,
+                            &self.text_shadow_blur_pipeline_state,
+                            instance_buffer,
+                            &mut instance_offset,
+                            viewport_size,
+                            &source,
+                            blur_encoder,
+                        );
+                        blur_encoder.end_encoding();
+                        if !rendered {
+                            break;
+                        }
+
+                        let composite_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                        rendered = self.draw_text_shadow_pass(
+                            shadow,
+                            &self.text_shadow_composite_pipeline_state,
+                            instance_buffer,
+                            &mut instance_offset,
+                            viewport_size,
+                            &blur,
+                            composite_encoder,
+                        );
+                        composite_encoder.end_encoding();
+                    }
+
+                    if rendered {
+                        rendered = self.draw_flat_scene_to_texture(
+                            &group.scene,
+                            instance_buffer,
+                            &mut instance_offset,
+                            viewport_size,
+                            command_buffer,
+                            texture,
+                            false,
+                        );
+                    }
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        |color_attachment| {
+                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                        },
+                    );
+                    rendered
                 }
             };
             if !ok {
@@ -1265,9 +1410,7 @@ impl MetalRenderer {
         self.stats_last_log = Some(now);
 
         let texture_bytes = |texture: &Option<metal::Texture>| {
-            texture
-                .as_ref()
-                .map_or(0, |t| t.width() * t.height() * 4)
+            texture.as_ref().map_or(0, |t| t.width() * t.height() * 4)
         };
         let backdrop_bytes =
             texture_bytes(&self.backdrop_scratch) + texture_bytes(&self.backdrop_blurred);
@@ -1305,14 +1448,19 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
         texture: &metal::TextureRef,
+        clear: bool,
     ) -> bool {
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
             viewport_size,
             |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+                if clear {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+                } else {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                }
             },
         );
         for batch in scene.batches() {
@@ -1385,6 +1533,7 @@ impl MetalRenderer {
                     ),
                 PrimitiveBatch::SubpixelSprites { .. }
                 | PrimitiveBatch::Surfaces(_)
+                | PrimitiveBatch::TextShadowGroup(_)
                 | PrimitiveBatch::LinearGradientMaskGroup(_) => false,
             };
             if !ok {
@@ -1393,6 +1542,65 @@ impl MetalRenderer {
             }
         }
         command_encoder.end_encoding();
+        true
+    }
+
+    fn draw_text_shadow_pass(
+        &self,
+        shadow: &ScaledTextShadow,
+        pipeline: &metal::RenderPipelineStateRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        source_texture: &metal::TextureRef,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        align_offset(instance_offset);
+        let next_offset = *instance_offset + mem::size_of::<ScaledTextShadow>();
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                shadow as *const ScaledTextShadow as *const u8,
+                buffer_contents,
+                mem::size_of::<ScaledTextShadow>(),
+            );
+        }
+        command_encoder.set_render_pipeline_state(pipeline);
+        command_encoder.set_vertex_buffer(
+            TextShadowInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            TextShadowInputIndex::Shadows as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            TextShadowInputIndex::Shadows as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            TextShadowInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            TextShadowInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            TextShadowInputIndex::SourceTexture as u64,
+            Some(source_texture),
+        );
+        command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
+        *instance_offset = next_offset;
         true
     }
 
@@ -1606,8 +1814,7 @@ impl MetalRenderer {
             }
         }
         let kernel: *mut objc::runtime::Object = unsafe {
-            let alloc: *mut objc::runtime::Object =
-                msg_send![class!(MPSImageGaussianBlur), alloc];
+            let alloc: *mut objc::runtime::Object = msg_send![class!(MPSImageGaussianBlur), alloc];
             let kernel: *mut objc::runtime::Object = msg_send![
                 alloc,
                 initWithDevice: self.device.as_ptr() as *mut objc::runtime::Object
@@ -1665,8 +1872,10 @@ impl MetalRenderer {
             mem::size_of_val(&source_rect) as u64,
             source_rect.as_ptr() as *const _,
         );
-        command_encoder
-            .set_fragment_texture(BackdropBlurInputIndex::SourceTexture as u64, Some(source_texture));
+        command_encoder.set_fragment_texture(
+            BackdropBlurInputIndex::SourceTexture as u64,
+            Some(source_texture),
+        );
 
         let blur_bytes_len = mem::size_of_val(blurs);
         let buffer_contents =
@@ -2321,6 +2530,7 @@ fn batch_first_order(scene: &Scene, batch: &PrimitiveBatch) -> DrawOrder {
             scene.polychrome_sprites[range.start].order
         }
         PrimitiveBatch::Surfaces(range) => scene.surfaces[range.start].order,
+        PrimitiveBatch::TextShadowGroup(index) => scene.text_shadow_groups[*index].order,
         PrimitiveBatch::LinearGradientMaskGroup(index) => {
             scene.linear_gradient_mask_groups[*index].order
         }
@@ -2436,6 +2646,14 @@ enum QuadInputIndex {
 enum LinearGradientMaskGroupInputIndex {
     Vertices = 0,
     Masks = 1,
+    ViewportSize = 2,
+    SourceTexture = 3,
+}
+
+#[repr(C)]
+enum TextShadowInputIndex {
+    Vertices = 0,
+    Shadows = 1,
     ViewportSize = 2,
     SourceTexture = 3,
 }
@@ -2686,7 +2904,10 @@ mod backdrop_blur_tests {
         let b = render(&mut scene);
 
         let diff = max_abs_diff(&a, &b, 0, 168, 152, 312);
-        assert!(diff <= 3, "vignette or shift at window edge: max diff {diff}");
+        assert!(
+            diff <= 3,
+            "vignette or shift at window edge: max diff {diff}"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
     PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    TextShadowGroup, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -107,6 +107,8 @@ struct WgpuPipelines {
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
     linear_mask_groups: wgpu::RenderPipeline,
+    text_shadow_blur: wgpu::RenderPipeline,
+    text_shadow_composite: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -139,6 +141,8 @@ struct WgpuResources {
     path_msaa_view: Option<wgpu::TextureView>,
     linear_mask_group_texture: Option<wgpu::Texture>,
     linear_mask_group_view: Option<wgpu::TextureView>,
+    text_shadow_blur_texture: Option<wgpu::Texture>,
+    text_shadow_blur_view: Option<wgpu::TextureView>,
 }
 
 impl WgpuResources {
@@ -149,6 +153,8 @@ impl WgpuResources {
         self.path_msaa_view = None;
         self.linear_mask_group_texture = None;
         self.linear_mask_group_view = None;
+        self.text_shadow_blur_texture = None;
+        self.text_shadow_blur_view = None;
     }
 }
 
@@ -486,6 +492,8 @@ impl WgpuRenderer {
             path_msaa_view: None,
             linear_mask_group_texture: None,
             linear_mask_group_view: None,
+            text_shadow_blur_texture: None,
+            text_shadow_blur_view: None,
         };
 
         Ok(Self {
@@ -904,6 +912,38 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let text_shadow_blur = create_pipeline(
+            "text_shadow_blur",
+            "text_shadow_blur_vertex",
+            "text_shadow_blur_fragment",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
+        let text_shadow_composite = create_pipeline(
+            "text_shadow_composite",
+            "text_shadow_composite_vertex",
+            "text_shadow_composite_fragment",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(blend_mode),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -926,6 +966,8 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             linear_mask_groups,
+            text_shadow_blur,
+            text_shadow_composite,
             surfaces,
         }
     }
@@ -1024,6 +1066,9 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.linear_mask_group_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.text_shadow_blur_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -1039,6 +1084,7 @@ impl WgpuRenderer {
     fn ensure_intermediate_textures(&mut self) {
         if self.resources().path_intermediate_texture.is_some()
             && self.resources().linear_mask_group_texture.is_some()
+            && self.resources().text_shadow_blur_texture.is_some()
         {
             return;
         }
@@ -1069,6 +1115,10 @@ impl WgpuRenderer {
             Self::create_path_intermediate(&resources.device, format, width, height);
         resources.linear_mask_group_texture = Some(linear_mask_group_texture);
         resources.linear_mask_group_view = Some(linear_mask_group_view);
+        let (text_shadow_blur_texture, text_shadow_blur_view) =
+            Self::create_path_intermediate(&resources.device, format, width, height);
+        resources.text_shadow_blur_texture = Some(text_shadow_blur_texture);
+        resources.text_shadow_blur_view = Some(text_shadow_blur_view);
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1328,6 +1378,30 @@ impl WgpuRenderer {
                                 false
                             }
                         }
+                        PrimitiveBatch::TextShadowGroup(index) => {
+                            drop(pass);
+                            let rendered = self.encode_text_shadow_group(
+                                &scene.text_shadow_groups[index],
+                                &mut encoder,
+                                &frame_view,
+                                &mut instance_offset,
+                            );
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_after_text_shadow"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            rendered
+                        }
                         PrimitiveBatch::Underlines(range) => self.draw_underlines(
                             &scene.underlines[range],
                             &mut instance_offset,
@@ -1486,6 +1560,7 @@ impl WgpuRenderer {
                     });
                     did_draw && self.draw_paths_from_intermediate(paths, instance_offset, &mut pass)
                 }
+                PrimitiveBatch::TextShadowGroup(_) => false,
                 PrimitiveBatch::Underlines(range) => {
                     self.draw_underlines(&scene.underlines[range], instance_offset, &mut pass)
                 }
@@ -1512,6 +1587,123 @@ impl WgpuRenderer {
                     ),
                 PrimitiveBatch::Surfaces(_) => false,
                 PrimitiveBatch::LinearGradientMaskGroup(_) => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn encode_text_shadow_group(
+        &self,
+        group: &TextShadowGroup,
+        encoder: &mut wgpu::CommandEncoder,
+        parent_view: &wgpu::TextureView,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let source_view = self
+            .resources()
+            .linear_mask_group_view
+            .as_ref()
+            .expect("text-shadow source scratch was ensured");
+        if !self.encode_flat_scene(&group.shadow_scene, encoder, source_view, instance_offset) {
+            return false;
+        }
+        let blur_view = self
+            .resources()
+            .text_shadow_blur_view
+            .as_ref()
+            .expect("text-shadow blur scratch was ensured");
+
+        for shadow in group.shadows.iter().rev() {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("text_shadow_horizontal_blur"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: blur_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                let data = unsafe { Self::instance_bytes(std::slice::from_ref(shadow)) };
+                if !self.draw_instances_with_texture(
+                    data,
+                    1,
+                    source_view,
+                    &self.resources().pipelines.text_shadow_blur,
+                    instance_offset,
+                    &mut pass,
+                ) {
+                    return false;
+                }
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("text_shadow_vertical_composite"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: parent_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                let data = unsafe { Self::instance_bytes(std::slice::from_ref(shadow)) };
+                if !self.draw_instances_with_texture(
+                    data,
+                    1,
+                    blur_view,
+                    &self.resources().pipelines.text_shadow_composite,
+                    instance_offset,
+                    &mut pass,
+                ) {
+                    return false;
+                }
+            }
+        }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("text_shadow_foreground"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: parent_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        for batch in group.scene.batches() {
+            let ok = match batch {
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                    .draw_monochrome_sprites(
+                        &group.scene.monochrome_sprites[range],
+                        texture_id,
+                        instance_offset,
+                        &mut pass,
+                    ),
+                PrimitiveBatch::SubpixelSprites { texture_id, range } => self
+                    .draw_subpixel_sprites(
+                        &group.scene.subpixel_sprites[range],
+                        texture_id,
+                        instance_offset,
+                        &mut pass,
+                    ),
+                _ => false,
             };
             if !ok {
                 return false;
