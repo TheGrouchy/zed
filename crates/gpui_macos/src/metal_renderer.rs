@@ -8,8 +8,8 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, DrawOrder,
-    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
-    ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
+    LinearGradientMaskParams, MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite,
+    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -155,6 +155,7 @@ pub(crate) struct MetalRenderer {
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
+    linear_mask_group_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
     /// Framebuffer snapshot (blit dst / gaussian src) + the blurred result the
@@ -183,6 +184,7 @@ pub(crate) struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    linear_mask_group_texture: Option<metal::Texture>,
     path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -333,6 +335,14 @@ impl MetalRenderer {
             "path_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let linear_mask_group_pipeline_state = build_path_sprite_pipeline_state(
+            &device,
+            &library,
+            "linear_mask_groups",
+            "linear_gradient_mask_group_vertex",
+            "linear_gradient_mask_group_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let shadows_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -407,6 +417,7 @@ impl MetalRenderer {
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
+            linear_mask_group_pipeline_state,
             shadows_pipeline_state,
             backdrop_blur_pipeline_state,
             backdrop_scratch: None,
@@ -426,6 +437,7 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            linear_mask_group_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
@@ -471,6 +483,7 @@ impl MetalRenderer {
         // actually draws paths recreates them at the right size.
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
+        self.linear_mask_group_texture = None;
     }
 
     /// Create the drawable-sized path intermediates if missing or stale.
@@ -518,6 +531,30 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+    }
+
+    fn ensure_linear_mask_group_texture(&mut self, size: Size<DevicePixels>) {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.linear_mask_group_texture = None;
+            return;
+        }
+        if self
+            .linear_mask_group_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            })
+        {
+            return;
+        }
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        self.linear_mask_group_texture = Some(self.device.new_texture(&descriptor));
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -943,6 +980,9 @@ impl MetalRenderer {
             self.path_free_frames = 0;
             self.ensure_path_intermediates(viewport_size);
         }
+        if !scene.linear_gradient_mask_groups.is_empty() {
+            self.ensure_linear_mask_group_texture(viewport_size);
+        }
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -1141,6 +1181,38 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                PrimitiveBatch::LinearGradientMaskGroup(index) => {
+                    command_encoder.end_encoding();
+                    let group = &scene.linear_gradient_mask_groups[index];
+                    let Some(scratch) = self.linear_mask_group_texture.clone() else {
+                        anyhow::bail!("linear mask group scratch texture is unavailable");
+                    };
+                    let flattened = self.draw_flat_scene_to_texture(
+                        &group.scene,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_buffer,
+                        &scratch,
+                    );
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        |color_attachment| {
+                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                        },
+                    );
+                    flattened
+                        && self.draw_linear_mask_group_composite(
+                            &group.mask,
+                            instance_buffer,
+                            &mut instance_offset,
+                            viewport_size,
+                            &scratch,
+                            command_encoder,
+                        )
+                }
             };
             if !ok {
                 command_encoder.end_encoding();
@@ -1223,6 +1295,158 @@ impl MetalRenderer {
             backdrop_bytes as f64 / (1024.0 * 1024.0),
             path_bytes as f64 / (1024.0 * 1024.0),
         );
+    }
+
+    fn draw_flat_scene_to_texture(
+        &self,
+        scene: &Scene,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        texture: &metal::TextureRef,
+    ) -> bool {
+        let mut command_encoder = new_command_encoder_for_texture(
+            command_buffer,
+            texture,
+            viewport_size,
+            |color_attachment| {
+                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+            },
+        );
+        for batch in scene.batches() {
+            let ok = match batch {
+                PrimitiveBatch::Shadows(range) => self.draw_shadows(
+                    &scene.shadows[range],
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Quads(range) => self.draw_quads(
+                    &scene.quads[range],
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Paths(range) => {
+                    let paths = &scene.paths[range];
+                    command_encoder.end_encoding();
+                    let did_draw = self.draw_paths_to_intermediate(
+                        paths,
+                        instance_buffer,
+                        instance_offset,
+                        viewport_size,
+                        command_buffer,
+                    );
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        |color_attachment| {
+                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                        },
+                    );
+                    did_draw
+                        && self.draw_paths_from_intermediate(
+                            paths,
+                            instance_buffer,
+                            instance_offset,
+                            viewport_size,
+                            command_encoder,
+                        )
+                }
+                PrimitiveBatch::Underlines(range) => self.draw_underlines(
+                    &scene.underlines[range],
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                    .draw_monochrome_sprites(
+                        texture_id,
+                        &scene.monochrome_sprites[range],
+                        instance_buffer,
+                        instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
+                    .draw_polychrome_sprites(
+                        texture_id,
+                        &scene.polychrome_sprites[range],
+                        instance_buffer,
+                        instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                PrimitiveBatch::SubpixelSprites { .. }
+                | PrimitiveBatch::Surfaces(_)
+                | PrimitiveBatch::LinearGradientMaskGroup(_) => false,
+            };
+            if !ok {
+                command_encoder.end_encoding();
+                return false;
+            }
+        }
+        command_encoder.end_encoding();
+        true
+    }
+
+    fn draw_linear_mask_group_composite(
+        &self,
+        mask: &LinearGradientMaskParams,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        source_texture: &metal::TextureRef,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        align_offset(instance_offset);
+        let next_offset = *instance_offset + mem::size_of::<LinearGradientMaskParams>();
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                mask as *const LinearGradientMaskParams as *const u8,
+                buffer_contents,
+                mem::size_of::<LinearGradientMaskParams>(),
+            );
+        }
+        command_encoder.set_render_pipeline_state(&self.linear_mask_group_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            LinearGradientMaskGroupInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            LinearGradientMaskGroupInputIndex::Masks as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            LinearGradientMaskGroupInputIndex::Masks as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            LinearGradientMaskGroupInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            LinearGradientMaskGroupInputIndex::SourceTexture as u64,
+            Some(source_texture),
+        );
+        command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
+        *instance_offset = next_offset;
+        true
     }
 
     fn draw_paths_to_intermediate(
@@ -2097,6 +2321,9 @@ fn batch_first_order(scene: &Scene, batch: &PrimitiveBatch) -> DrawOrder {
             scene.polychrome_sprites[range.start].order
         }
         PrimitiveBatch::Surfaces(range) => scene.surfaces[range.start].order,
+        PrimitiveBatch::LinearGradientMaskGroup(index) => {
+            scene.linear_gradient_mask_groups[*index].order
+        }
     }
 }
 
@@ -2203,6 +2430,14 @@ enum QuadInputIndex {
     Vertices = 0,
     Quads = 1,
     ViewportSize = 2,
+}
+
+#[repr(C)]
+enum LinearGradientMaskGroupInputIndex {
+    Vertices = 0,
+    Masks = 1,
+    ViewportSize = 2,
+    SourceTexture = 3,
 }
 
 #[repr(C)]

@@ -533,6 +533,37 @@ float linear_gradient_mask_alpha(float2 position, LinearGradientMaskParams mask)
     return lerp(mask.stops[stop_index].alpha, mask.stops[stop_index + 1u].alpha, factor);
 }
 
+struct LinearGradientMaskGroupVertexOutput {
+    nointerpolation uint mask_id: TEXCOORD0;
+    float4 position: SV_Position;
+};
+
+StructuredBuffer<LinearGradientMaskParams> linear_gradient_mask_groups: register(t1);
+
+LinearGradientMaskGroupVertexOutput linear_gradient_mask_group_vertex(
+    uint vertex_id: SV_VertexID,
+    uint mask_id: SV_InstanceID
+) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    LinearGradientMaskParams mask = linear_gradient_mask_groups[mask_id];
+    LinearGradientMaskGroupVertexOutput output;
+    output.mask_id = mask_id;
+    output.position = to_device_position(unit_vertex, mask.bounds);
+    return output;
+}
+
+float4 linear_gradient_mask_group_fragment(
+    LinearGradientMaskGroupVertexOutput input
+): SV_Target {
+    LinearGradientMaskParams mask = linear_gradient_mask_groups[input.mask_id];
+    float2 uv = input.position.xy / global_viewport_size;
+    float4 flattened_group = t_sprite.Sample(s_sprite, uv);
+    float mask_alpha = linear_gradient_mask_alpha(input.position.xy, mask);
+    // The scratch target is premultiplied. Scale color and alpha together,
+    // then composite with ONE / INV_SRC_ALPHA exactly once.
+    return flattened_group * mask_alpha;
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //

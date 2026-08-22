@@ -46,6 +46,36 @@ struct GradientColor {
 };
 GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla color0, Hsla color1);
 
+struct LinearGradientMaskGroupVertexOutput {
+  uint mask_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex LinearGradientMaskGroupVertexOutput linear_gradient_mask_group_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    uint mask_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(LinearGradientMaskGroupInputIndex_Vertices)]],
+    constant LinearGradientMaskParams *masks [[buffer(LinearGradientMaskGroupInputIndex_Masks)]],
+    constant Size_DevicePixels *viewport_size [[buffer(LinearGradientMaskGroupInputIndex_ViewportSize)]]) {
+  LinearGradientMaskParams mask = masks[mask_id];
+  return LinearGradientMaskGroupVertexOutput{
+    mask_id,
+    to_device_position(unit_vertices[unit_vertex_id], mask.bounds, viewport_size),
+  };
+}
+
+fragment float4 linear_gradient_mask_group_fragment(
+    LinearGradientMaskGroupVertexOutput input [[stage_in]],
+    constant LinearGradientMaskParams *masks [[buffer(LinearGradientMaskGroupInputIndex_Masks)]],
+    texture2d<float> flattened_group [[texture(LinearGradientMaskGroupInputIndex_SourceTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float2 size = float2(flattened_group.get_width(), flattened_group.get_height());
+  float2 uv = input.position.xy / size;
+  float4 flattened_group_pixel = flattened_group.sample(texture_sampler, uv);
+  float mask_alpha = linear_gradient_mask_alpha(input.position.xy, masks[input.mask_id]);
+  return flattened_group_pixel * mask_alpha;
+}
+
 struct QuadVertexOutput {
   uint quad_id [[flat]];
   float4 position [[position]];

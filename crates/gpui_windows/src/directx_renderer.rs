@@ -77,6 +77,9 @@ struct DirectXResources {
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    linear_mask_group_texture: ID3D11Texture2D,
+    linear_mask_group_srv: Option<ID3D11ShaderResourceView>,
+    linear_mask_group_view: Option<ID3D11RenderTargetView>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -87,6 +90,7 @@ struct DirectXRenderPipelines {
     quad_pipeline: PipelineState<Quad>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
+    linear_mask_group_pipeline: PipelineState<LinearGradientMaskParams>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
@@ -341,16 +345,31 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+        let render_target_view = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .render_target_view
+            .clone();
+        self.draw_scene_batches(scene, &render_target_view, annotation.as_ref())?;
+        self.present()
+    }
+
+    fn draw_scene_batches(
+        &mut self,
+        scene: &Scene,
+        target_view: &Option<ID3D11RenderTargetView>,
+        annotation: Option<&ID3DUserDefinedAnnotation>,
+    ) -> Result<()> {
         for batch in scene.batches() {
             let _annotation = annotation
-                .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
+                    self.draw_paths_to_intermediate(paths, target_view)?;
                     self.draw_paths_from_intermediate(paths)
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
@@ -364,6 +383,14 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::LinearGradientMaskGroup(index) => {
+                    self.draw_linear_gradient_mask_group(
+                        &scene.linear_gradient_mask_groups[index],
+                        target_view,
+                        annotation,
+                    )?;
+                    self.upload_scene_buffers(scene)
+                }
             }
             .with_context(|| {
                 format!(
@@ -380,7 +407,7 @@ impl DirectXRenderer {
                 )
             })?;
         }
-        self.present()
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -525,7 +552,11 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        target_view: &Option<ID3D11RenderTargetView>,
+    ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -584,7 +615,7 @@ impl DirectXRenderer {
             // Restore main render target
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(target_view)), None);
         }
 
         Ok(())
@@ -633,6 +664,58 @@ impl DirectXRenderer {
             slice::from_ref(&self.globals.global_params_buffer),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
+        )
+    }
+
+    fn draw_linear_gradient_mask_group(
+        &mut self,
+        group: &LinearGradientMaskGroup,
+        parent_target: &Option<ID3D11RenderTargetView>,
+        annotation: Option<&ID3DUserDefinedAnnotation>,
+    ) -> Result<()> {
+        let (scratch_view, scratch_srv) = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            (
+                resources.linear_mask_group_view.clone(),
+                resources.linear_mask_group_srv.clone(),
+            )
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        unsafe {
+            devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
+            devices.device_context.ClearRenderTargetView(
+                scratch_view.as_ref().context("missing mask group view")?,
+                &[0.0; 4],
+            );
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&scratch_view)), None);
+        }
+
+        self.upload_scene_buffers(&group.scene)?;
+        self.draw_scene_batches(&group.scene, &scratch_view, annotation)?;
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        unsafe {
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(parent_target)), None);
+        }
+        self.pipelines.linear_mask_group_pipeline.update_buffer(
+            &devices.device,
+            &devices.device_context,
+            slice::from_ref(&group.mask),
+        )?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        self.pipelines.linear_mask_group_pipeline.draw_with_texture(
+            &devices.device_context,
+            slice::from_ref(&scratch_srv),
+            slice::from_ref(&resources.viewport),
+            slice::from_ref(&self.globals.global_params_buffer),
+            slice::from_ref(&self.globals.sampler),
+            1,
         )
     }
 
@@ -810,6 +893,8 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             viewport,
         ) = create_resources(devices, &swap_chain, width, height)?;
+        let (linear_mask_group_texture, linear_mask_group_srv, linear_mask_group_view) =
+            create_linear_mask_group_texture(&devices.device, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
@@ -820,6 +905,9 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
+            linear_mask_group_texture,
+            linear_mask_group_srv,
+            linear_mask_group_view,
             viewport,
         })
     }
@@ -840,12 +928,17 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             viewport,
         ) = create_resources(devices, &self.swap_chain, width, height)?;
+        let (linear_mask_group_texture, linear_mask_group_srv, linear_mask_group_view) =
+            create_linear_mask_group_texture(&devices.device, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.path_intermediate_texture = path_intermediate_texture;
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
+        self.linear_mask_group_texture = linear_mask_group_texture;
+        self.linear_mask_group_srv = linear_mask_group_srv;
+        self.linear_mask_group_view = linear_mask_group_view;
         self.viewport = viewport;
         Ok(())
     }
@@ -881,6 +974,13 @@ impl DirectXRenderPipelines {
             4,
             create_blend_state_for_path_sprite(device)?,
         )?;
+        let linear_mask_group_pipeline = PipelineState::new(
+            device,
+            "linear_mask_group_pipeline",
+            ShaderModule::LinearGradientMaskGroup,
+            1,
+            create_blend_state_for_path_rasterization(device)?,
+        )?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
@@ -915,6 +1015,7 @@ impl DirectXRenderPipelines {
             quad_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
+            linear_mask_group_pipeline,
             underline_pipeline,
             mono_sprites,
             subpixel_sprites,
@@ -1339,6 +1440,24 @@ fn create_path_intermediate_texture(
 }
 
 #[inline]
+fn create_linear_mask_group_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(
+    ID3D11Texture2D,
+    Option<ID3D11ShaderResourceView>,
+    Option<ID3D11RenderTargetView>,
+)> {
+    let (texture, shader_resource_view) = create_path_intermediate_texture(device, width, height)?;
+    let mut render_target_view = None;
+    unsafe {
+        device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))?;
+    }
+    Ok((texture, shader_resource_view, render_target_view))
+}
+
+#[inline]
 fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
     width: u32,
@@ -1416,7 +1535,7 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -1477,7 +1596,7 @@ fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11Ble
     desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -1628,6 +1747,7 @@ pub(crate) mod shader_resources {
         Underline,
         PathRasterization,
         PathSprite,
+        LinearGradientMaskGroup,
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
@@ -1692,6 +1812,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PathSprite => match target {
                     ShaderTarget::Vertex => PATH_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => PATH_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::LinearGradientMaskGroup => match target {
+                    ShaderTarget::Vertex => LINEAR_GRADIENT_MASK_GROUP_VERTEX_BYTES,
+                    ShaderTarget::Fragment => LINEAR_GRADIENT_MASK_GROUP_FRAGMENT_BYTES,
                 },
                 ShaderModule::MonochromeSprite => match target {
                     ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
@@ -1792,6 +1916,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",
                 ShaderModule::PathSprite => "path_sprite",
+                ShaderModule::LinearGradientMaskGroup => "linear_gradient_mask_group",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
@@ -1810,6 +1935,17 @@ pub(crate) mod shader_resources {
                 .expect("quad vertex shader must compile");
             build_shader_blob(ShaderModule::Quad, ShaderTarget::Fragment)
                 .expect("quad fragment shader with native mask must compile");
+        }
+
+        #[test]
+        fn linear_mask_group_composite_shaders_compile_with_fxc() {
+            build_shader_blob(ShaderModule::LinearGradientMaskGroup, ShaderTarget::Vertex)
+                .expect("mask group vertex shader must compile");
+            build_shader_blob(
+                ShaderModule::LinearGradientMaskGroup,
+                ShaderTarget::Fragment,
+            )
+            .expect("mask group fragment shader must compile");
         }
     }
 }

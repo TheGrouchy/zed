@@ -106,6 +106,7 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    linear_mask_groups: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -136,6 +137,8 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    linear_mask_group_texture: Option<wgpu::Texture>,
+    linear_mask_group_view: Option<wgpu::TextureView>,
 }
 
 impl WgpuResources {
@@ -144,6 +147,8 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.linear_mask_group_texture = None;
+        self.linear_mask_group_view = None;
     }
 }
 
@@ -479,6 +484,8 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            linear_mask_group_texture: None,
+            linear_mask_group_view: None,
         };
 
         Ok(Self {
@@ -881,6 +888,22 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let linear_mask_groups = create_pipeline(
+            "linear_mask_groups",
+            "linear_gradient_mask_group_vertex",
+            "linear_gradient_mask_group_fragment",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -902,6 +925,7 @@ impl WgpuRenderer {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            linear_mask_groups,
             surfaces,
         }
     }
@@ -997,6 +1021,9 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.linear_mask_group_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -1010,7 +1037,9 @@ impl WgpuRenderer {
     }
 
     fn ensure_intermediate_textures(&mut self) {
-        if self.resources().path_intermediate_texture.is_some() {
+        if self.resources().path_intermediate_texture.is_some()
+            && self.resources().linear_mask_group_texture.is_some()
+        {
             return;
         }
 
@@ -1035,6 +1064,11 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+
+        let (linear_mask_group_texture, linear_mask_group_view) =
+            Self::create_path_intermediate(&resources.device, format, width, height);
+        resources.linear_mask_group_texture = Some(linear_mask_group_texture);
+        resources.linear_mask_group_view = Some(linear_mask_group_view);
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1325,6 +1359,50 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::LinearGradientMaskGroup(index) => {
+                            drop(pass);
+                            let group = &scene.linear_gradient_mask_groups[index];
+                            let scratch_view = self
+                                .resources()
+                                .linear_mask_group_view
+                                .as_ref()
+                                .expect("mask group scratch was ensured");
+                            let flattened = self.encode_flat_scene(
+                                &group.scene,
+                                &mut encoder,
+                                scratch_view,
+                                &mut instance_offset,
+                            );
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_after_mask_group"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            if !flattened {
+                                false
+                            } else {
+                                let data = unsafe {
+                                    Self::instance_bytes(std::slice::from_ref(&group.mask))
+                                };
+                                self.draw_instances_with_texture(
+                                    data,
+                                    1,
+                                    scratch_view,
+                                    &self.resources().pipelines.linear_mask_groups,
+                                    &mut instance_offset,
+                                    &mut pass,
+                                )
+                            }
+                        }
                     };
                     if !ok {
                         overflow = true;
@@ -1353,6 +1431,93 @@ impl WgpuRenderer {
             frame.present();
             return true;
         }
+    }
+
+    fn encode_flat_scene(
+        &self,
+        scene: &Scene,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("linear_mask_group_flatten"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+
+        for batch in scene.batches() {
+            let ok = match batch {
+                PrimitiveBatch::Quads(range) => {
+                    self.draw_quads(&scene.quads[range], instance_offset, &mut pass)
+                }
+                PrimitiveBatch::Shadows(range) => {
+                    self.draw_shadows(&scene.shadows[range], instance_offset, &mut pass)
+                }
+                PrimitiveBatch::Paths(range) => {
+                    let paths = &scene.paths[range];
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    drop(pass);
+                    let did_draw = self.draw_paths_to_intermediate(encoder, paths, instance_offset);
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("linear_mask_group_flatten_continued"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    did_draw && self.draw_paths_from_intermediate(paths, instance_offset, &mut pass)
+                }
+                PrimitiveBatch::Underlines(range) => {
+                    self.draw_underlines(&scene.underlines[range], instance_offset, &mut pass)
+                }
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                    .draw_monochrome_sprites(
+                        &scene.monochrome_sprites[range],
+                        texture_id,
+                        instance_offset,
+                        &mut pass,
+                    ),
+                PrimitiveBatch::SubpixelSprites { texture_id, range } => self
+                    .draw_subpixel_sprites(
+                        &scene.subpixel_sprites[range],
+                        texture_id,
+                        instance_offset,
+                        &mut pass,
+                    ),
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
+                    .draw_polychrome_sprites(
+                        &scene.polychrome_sprites[range],
+                        texture_id,
+                        instance_offset,
+                        &mut pass,
+                    ),
+                PrimitiveBatch::Surfaces(_) => false,
+                PrimitiveBatch::LinearGradientMaskGroup(_) => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
     }
 
     fn draw_quads(

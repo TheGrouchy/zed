@@ -279,6 +279,7 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    layer_underflowed: bool,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -291,7 +292,59 @@ pub struct Scene {
     /// stream: the renderer breaks its render pass at each blur's order to
     /// snapshot the framebuffer (macOS Metal; other renderers ignore them).
     pub backdrop_blurs: Vec<BackdropBlur>,
+    /// Atomic subtree groups whose children must be flattened before the
+    /// linear alpha mask is applied once to the group result.
+    pub linear_gradient_mask_groups: Vec<LinearGradientMaskGroup>,
+    active_linear_gradient_mask_group: Option<ActiveLinearGradientMaskGroup>,
 }
+
+#[expect(missing_docs)]
+pub struct LinearGradientMaskGroup {
+    pub order: DrawOrder,
+    pub mask: LinearGradientMaskParams,
+    pub scene: Box<Scene>,
+}
+
+struct ActiveLinearGradientMaskGroup {
+    order: DrawOrder,
+    mask: LinearGradientMaskParams,
+    scene: Box<Scene>,
+    paint_operation_start: usize,
+}
+
+/// A failure that prevents a subtree mask from being represented exactly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LinearGradientMaskGroupError {
+    /// No group is active at the matching pop boundary.
+    NoActiveGroup,
+    /// CSS mask groups cannot be flattened recursively by this bounded path.
+    NestedGroup,
+    /// A layer opened inside the group was not closed inside the group.
+    UnbalancedLayer,
+    /// Backdrop sampling needs a separate, explicitly defined group contract.
+    BackdropBlur,
+    /// Platform video surfaces cannot be sampled into the mask texture.
+    Surface,
+    /// LCD subpixel text cannot be flattened into a transparent alpha group.
+    SubpixelText,
+}
+
+impl fmt::Display for LinearGradientMaskGroupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoActiveGroup => write!(formatter, "no linear mask group is active"),
+            Self::NestedGroup => write!(formatter, "nested linear mask groups are unsupported"),
+            Self::UnbalancedLayer => write!(formatter, "linear mask group has an unbalanced layer"),
+            Self::BackdropBlur => write!(formatter, "linear mask group contains a backdrop blur"),
+            Self::Surface => write!(formatter, "linear mask group contains a platform surface"),
+            Self::SubpixelText => {
+                write!(formatter, "linear mask group contains LCD subpixel text")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LinearGradientMaskGroupError {}
 
 #[expect(missing_docs)]
 impl Scene {
@@ -299,6 +352,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.layer_underflowed = false;
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -308,6 +362,8 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
+        self.linear_gradient_mask_groups.clear();
+        self.active_linear_gradient_mask_group = None;
     }
 
     pub fn len(&self) -> usize {
@@ -315,6 +371,12 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        if let Some(group) = self.active_linear_gradient_mask_group.as_mut() {
+            group.scene.push_layer(bounds);
+            self.paint_operations
+                .push(PaintOperation::StartLayer(bounds));
+            return;
+        }
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
         self.paint_operations
@@ -322,11 +384,27 @@ impl Scene {
     }
 
     pub fn pop_layer(&mut self) {
-        self.layer_stack.pop();
+        if let Some(group) = self.active_linear_gradient_mask_group.as_mut() {
+            group.scene.pop_layer();
+            self.paint_operations.push(PaintOperation::EndLayer);
+            return;
+        }
+        if self.layer_stack.pop().is_none() {
+            self.layer_underflowed = true;
+        }
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
     pub fn insert_backdrop_blur(&mut self, mut blur: BackdropBlur) {
+        if let Some(group) = self.active_linear_gradient_mask_group.as_mut() {
+            let previous_len = group.scene.len();
+            group.scene.insert_backdrop_blur(blur);
+            if group.scene.len() != previous_len {
+                self.paint_operations
+                    .push(PaintOperation::BackdropBlur(blur));
+            }
+            return;
+        }
         let clipped_bounds = blur.bounds.intersect(&blur.content_mask.bounds);
         if clipped_bounds.is_empty() {
             return;
@@ -343,6 +421,15 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        if let Some(group) = self.active_linear_gradient_mask_group.as_mut() {
+            let previous_len = group.scene.len();
+            group.scene.insert_primitive(primitive.clone());
+            if group.scene.len() != previous_len {
+                self.paint_operations
+                    .push(PaintOperation::Primitive(primitive));
+            }
+            return;
+        }
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -395,6 +482,70 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Begins an atomic subtree whose fully composited pixels will receive one
+    /// linear alpha mask. Nested groups fail closed.
+    pub fn push_linear_gradient_mask_group(
+        &mut self,
+        mask: LinearGradientMaskParams,
+    ) -> Result<(), LinearGradientMaskGroupError> {
+        if self.active_linear_gradient_mask_group.is_some() {
+            return Err(LinearGradientMaskGroupError::NestedGroup);
+        }
+        let order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(mask.bounds));
+        let paint_operation_start = self.paint_operations.len();
+        self.paint_operations
+            .push(PaintOperation::StartLinearGradientMaskGroup(mask));
+        self.active_linear_gradient_mask_group = Some(ActiveLinearGradientMaskGroup {
+            order,
+            mask,
+            scene: Box::default(),
+            paint_operation_start,
+        });
+        Ok(())
+    }
+
+    /// Finishes the active group, rejecting child constructs that cannot be
+    /// sampled by all native renderers. A rejected group's children are
+    /// discarded rather than painted without their mask.
+    pub fn pop_linear_gradient_mask_group(&mut self) -> Result<(), LinearGradientMaskGroupError> {
+        let Some(mut active) = self.active_linear_gradient_mask_group.take() else {
+            return Err(LinearGradientMaskGroupError::NoActiveGroup);
+        };
+        let validation = if !active.scene.layer_stack.is_empty() || active.scene.layer_underflowed {
+            Err(LinearGradientMaskGroupError::UnbalancedLayer)
+        } else if !active.scene.backdrop_blurs.is_empty() {
+            Err(LinearGradientMaskGroupError::BackdropBlur)
+        } else if !active.scene.surfaces.is_empty() {
+            Err(LinearGradientMaskGroupError::Surface)
+        } else if !active.scene.subpixel_sprites.is_empty() {
+            Err(LinearGradientMaskGroupError::SubpixelText)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = validation {
+            self.paint_operations.truncate(active.paint_operation_start);
+            return Err(error);
+        }
+        active.scene.finish();
+        if active.scene.paint_operations.is_empty() {
+            self.paint_operations.truncate(active.paint_operation_start);
+            return Ok(());
+        }
+        self.linear_gradient_mask_groups
+            .push(LinearGradientMaskGroup {
+                order: active.order,
+                mask: active.mask,
+                scene: active.scene,
+            });
+        self.paint_operations
+            .push(PaintOperation::EndLinearGradientMaskGroup);
+        Ok(())
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -402,6 +553,14 @@ impl Scene {
                 PaintOperation::BackdropBlur(blur) => self.insert_backdrop_blur(*blur),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartLinearGradientMaskGroup(mask) => {
+                    self.push_linear_gradient_mask_group(*mask)
+                        .expect("validated mask groups cannot become nested during replay");
+                }
+                PaintOperation::EndLinearGradientMaskGroup => {
+                    self.pop_linear_gradient_mask_group()
+                        .expect("validated mask group replay must remain representable");
+                }
             }
         }
     }
@@ -419,6 +578,8 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        self.linear_gradient_mask_groups
+            .sort_by_key(|group| group.order);
     }
 
     #[cfg_attr(
@@ -446,6 +607,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            linear_gradient_mask_groups_start: 0,
+            linear_gradient_mask_groups_iter: self.linear_gradient_mask_groups.iter().peekable(),
         }
     }
 }
@@ -468,13 +631,17 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    LinearGradientMaskGroup,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     BackdropBlur(BackdropBlur),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    StartLinearGradientMaskGroup(LinearGradientMaskParams),
+    EndLinearGradientMaskGroup,
 }
 
 #[derive(Clone)]
@@ -543,6 +710,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    linear_gradient_mask_groups_start: usize,
+    linear_gradient_mask_groups_iter: Peekable<slice::Iter<'a, LinearGradientMaskGroup>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -575,6 +744,12 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.linear_gradient_mask_groups_iter
+                    .peek()
+                    .map(|g| g.order),
+                PrimitiveKind::LinearGradientMaskGroup,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -721,6 +896,12 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::LinearGradientMaskGroup => {
+                let group_index = self.linear_gradient_mask_groups_start;
+                self.linear_gradient_mask_groups_iter.next();
+                self.linear_gradient_mask_groups_start += 1;
+                Some(PrimitiveBatch::LinearGradientMaskGroup(group_index))
+            }
         }
     }
 }
@@ -753,6 +934,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    LinearGradientMaskGroup(usize),
 }
 
 impl PrimitiveBatch {
@@ -785,6 +967,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::LinearGradientMaskGroup(_) => "linear gradient mask group".into(),
         }
     }
 }
@@ -1456,6 +1639,150 @@ mod linear_gradient_mask_tests {
                     && shader.contains("percentage")
                     && shader.contains("offset"),
                 "{renderer} is missing the typed percentage-plus-pixel stop ABI"
+            );
+        }
+    }
+
+    fn scaled_locked_mask() -> LinearGradientMaskParams {
+        LinearGradientMask::try_new(
+            mask_bounds(),
+            LinearGradientMaskDirection::ToBottom,
+            &[stop(1.0, 0.0, 0.0), stop(0.0, 1.0, 0.0)],
+        )
+        .unwrap()
+        .scale(1.0)
+    }
+
+    fn group_quad(x: f32) -> Quad {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(20.0)),
+            size: Size {
+                width: ScaledPixels(80.0),
+                height: ScaledPixels(80.0),
+            },
+        };
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mask_group_preserves_overlapping_children_as_one_atomic_batch() {
+        let mut scene = Scene::default();
+        scene
+            .push_linear_gradient_mask_group(scaled_locked_mask())
+            .unwrap();
+        scene.insert_primitive(group_quad(10.0));
+        scene.insert_primitive(group_quad(40.0));
+        scene.pop_linear_gradient_mask_group().unwrap();
+        scene.finish();
+
+        assert!(
+            scene.quads.is_empty(),
+            "children must not leak into the parent"
+        );
+        assert_eq!(scene.linear_gradient_mask_groups.len(), 1);
+        assert_eq!(scene.linear_gradient_mask_groups[0].scene.quads.len(), 2);
+        assert!(matches!(
+            scene.batches().collect::<Vec<_>>().as_slice(),
+            [PrimitiveBatch::LinearGradientMaskGroup(0)]
+        ));
+    }
+
+    #[test]
+    fn group_masking_differs_from_incorrect_per_primitive_masking_at_overlap() {
+        let child_alpha = 0.5_f32;
+        let mask_alpha = 0.5_f32;
+        let flattened_alpha = child_alpha + child_alpha * (1.0 - child_alpha);
+        let exact_group_alpha = flattened_alpha * mask_alpha;
+        let individually_masked_alpha =
+            child_alpha * mask_alpha + child_alpha * mask_alpha * (1.0 - child_alpha * mask_alpha);
+
+        assert_close(exact_group_alpha, 0.375);
+        assert_close(individually_masked_alpha, 0.4375);
+        assert_ne!(exact_group_alpha, individually_masked_alpha);
+    }
+
+    #[test]
+    fn mask_group_replays_as_an_atomic_subscene() {
+        let mut previous = Scene::default();
+        previous
+            .push_linear_gradient_mask_group(scaled_locked_mask())
+            .unwrap();
+        previous.insert_primitive(group_quad(10.0));
+        previous.insert_primitive(group_quad(40.0));
+        previous.pop_linear_gradient_mask_group().unwrap();
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..previous.len(), &previous);
+        replayed.finish();
+        assert_eq!(replayed.linear_gradient_mask_groups.len(), 1);
+        assert_eq!(replayed.linear_gradient_mask_groups[0].scene.quads.len(), 2);
+    }
+
+    #[test]
+    fn unsupported_mask_group_children_fail_closed_without_leaking() {
+        let mut scene = Scene::default();
+        scene
+            .push_linear_gradient_mask_group(scaled_locked_mask())
+            .unwrap();
+        scene.insert_primitive(group_quad(10.0));
+        scene.insert_backdrop_blur(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(4.0),
+            bounds: scaled_locked_mask().bounds,
+            content_mask: ContentMask {
+                bounds: scaled_locked_mask().bounds,
+            },
+            corner_radii: Default::default(),
+        });
+        assert_eq!(
+            scene.pop_linear_gradient_mask_group(),
+            Err(LinearGradientMaskGroupError::BackdropBlur)
+        );
+        assert!(scene.quads.is_empty());
+        assert!(scene.linear_gradient_mask_groups.is_empty());
+        assert_eq!(scene.len(), 0);
+    }
+
+    #[test]
+    fn nested_mask_groups_fail_before_accepting_children() {
+        let mut scene = Scene::default();
+        scene
+            .push_linear_gradient_mask_group(scaled_locked_mask())
+            .unwrap();
+        assert_eq!(
+            scene.push_linear_gradient_mask_group(scaled_locked_mask()),
+            Err(LinearGradientMaskGroupError::NestedGroup)
+        );
+    }
+
+    #[test]
+    fn every_renderer_flattens_then_masks_the_group_once() {
+        for (renderer, shader) in [
+            (
+                "DirectX HLSL",
+                include_str!("../../gpui_windows/src/shaders.hlsl"),
+            ),
+            (
+                "WGPU WGSL",
+                include_str!("../../gpui_wgpu/src/shaders.wgsl"),
+            ),
+            (
+                "macOS Metal",
+                include_str!("../../gpui_macos/src/shaders.metal"),
+            ),
+        ] {
+            assert!(
+                shader.contains("linear_gradient_mask_group_vertex")
+                    && shader.contains("linear_gradient_mask_group_fragment"),
+                "{renderer} is missing the group composite shader pair"
+            );
+            assert!(
+                shader.contains("flattened_group") && shader.contains("* mask_alpha"),
+                "{renderer} does not apply the mask once to the flattened group texture"
             );
         }
     }

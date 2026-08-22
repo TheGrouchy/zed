@@ -640,6 +640,35 @@ fn linear_gradient_mask_alpha(position: vec2<f32>, mask: LinearGradientMaskParam
     return mix(mask.stops[stop_index].alpha, mask.stops[stop_index + 1u].alpha, factor);
 }
 
+@group(1) @binding(0) var<storage, read> b_linear_gradient_mask_groups: array<LinearGradientMaskParams>;
+
+struct LinearGradientMaskGroupVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) mask_id: u32,
+}
+
+@vertex
+fn linear_gradient_mask_group_vertex(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32,
+) -> LinearGradientMaskGroupVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let mask = b_linear_gradient_mask_groups[instance_id];
+    var out: LinearGradientMaskGroupVarying;
+    out.position = to_device_position(unit_vertex, mask.bounds);
+    out.mask_id = instance_id;
+    return out;
+}
+
+@fragment
+fn linear_gradient_mask_group_fragment(input: LinearGradientMaskGroupVarying) -> @location(0) vec4<f32> {
+    let mask = b_linear_gradient_mask_groups[input.mask_id];
+    let uv = input.position.xy / globals.viewport_size;
+    let flattened_group = textureSample(t_sprite, s_sprite, uv);
+    let mask_alpha = linear_gradient_mask_alpha(input.position.xy, mask);
+    return flattened_group * mask_alpha;
+}
+
 struct Quad {
     order: u32,
     border_style: u32,

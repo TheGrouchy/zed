@@ -58,6 +58,7 @@ mod macos_build {
             "Quad".into(),
             "LinearGradientMaskDirection".into(),
             "LinearGradientMaskParams".into(),
+            "LinearGradientMaskGroupInputIndex".into(),
             "ScaledLinearGradientMaskStop".into(),
             "BorderStyle".into(),
             "SpriteInputIndex".into(),
