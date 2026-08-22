@@ -652,7 +652,8 @@ impl DirectWriteState {
             );
         }
 
-        let mut pending_resources = Vec::with_capacity(registry.resources().len());
+        let mut aliases = HashMap::default();
+        let mut pending_faces = Vec::new();
         for resource in registry.resources() {
             let data = resource.bytes().as_ref();
             let font_file = unsafe {
@@ -670,25 +671,32 @@ impl DirectWriteState {
             let temporary_set = unsafe { temporary_builder.CreateFontSet()? };
             let font_count = unsafe { temporary_set.GetFontCount() };
             ensure!(
-                font_count == 1,
-                "embedded CSS font resource {} contains {font_count} faces; exactly one is required",
+                font_count > 0,
+                "embedded CSS font resource {} contains no selectable faces",
                 resource.id()
             );
-            let face_reference = unsafe { temporary_set.GetFontFaceReference(0)? };
-            let face: IDWriteFontFace5 = unsafe { face_reference.CreateFontFace()?.cast()? };
             let native_alias = resource.native_family_alias();
-            let weight = HSTRING::from(unsafe { face.GetWeight().0 }.to_string());
-            pending_resources.push((
-                resource.id().to_string(),
-                face_reference,
-                native_alias,
-                weight,
-            ));
+            aliases.insert(resource.id().to_string(), native_alias.clone());
+            for face_index in 0..font_count {
+                let face_reference = unsafe { temporary_set.GetFontFaceReference(face_index)? };
+                let face: IDWriteFontFace5 = unsafe { face_reference.CreateFontFace()?.cast()? };
+                pending_faces.push((
+                    face_reference,
+                    native_alias.clone(),
+                    face_index,
+                    unsafe { face.GetWeight().0 },
+                    unsafe { face.GetStretch().0 },
+                    unsafe { face.GetStyle().0 },
+                ));
+            }
         }
 
-        let mut aliases = HashMap::default();
-        for (resource_id, face_reference, native_alias, weight) in pending_resources {
+        for (face_reference, native_alias, face_index, weight, stretch, style) in pending_faces {
             let alias = HSTRING::from(native_alias.as_ref());
+            let full_name = HSTRING::from(format!("{native_alias}.face.{face_index}"));
+            let weight = HSTRING::from(weight.to_string());
+            let stretch = HSTRING::from(stretch.to_string());
+            let style = HSTRING::from(style.to_string());
             let properties = [
                 DWRITE_FONT_PROPERTY {
                     propertyId: DWRITE_FONT_PROPERTY_ID_FAMILY_NAME,
@@ -697,12 +705,22 @@ impl DirectWriteState {
                 },
                 DWRITE_FONT_PROPERTY {
                     propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
-                    propertyValue: PCWSTR(alias.as_ptr()),
+                    propertyValue: PCWSTR(full_name.as_ptr()),
                     localeName: DEFAULT_LOCALE_NAME,
                 },
                 DWRITE_FONT_PROPERTY {
                     propertyId: DWRITE_FONT_PROPERTY_ID_WEIGHT,
                     propertyValue: PCWSTR(weight.as_ptr()),
+                    localeName: PCWSTR::null(),
+                },
+                DWRITE_FONT_PROPERTY {
+                    propertyId: DWRITE_FONT_PROPERTY_ID_STRETCH,
+                    propertyValue: PCWSTR(stretch.as_ptr()),
+                    localeName: PCWSTR::null(),
+                },
+                DWRITE_FONT_PROPERTY {
+                    propertyId: DWRITE_FONT_PROPERTY_ID_STYLE,
+                    propertyValue: PCWSTR(style.as_ptr()),
                     localeName: PCWSTR::null(),
                 },
             ];
@@ -711,7 +729,6 @@ impl DirectWriteState {
                     .builder
                     .AddFontFaceReference(&face_reference, &properties)?;
             }
-            aliases.insert(resource_id, native_alias);
         }
 
         let mut registered_faces = Vec::with_capacity(registry.faces().len());
@@ -2483,6 +2500,7 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use crate::DirectXDevices;
@@ -2496,6 +2514,52 @@ mod tests {
 
     const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
     const LILEX_BOLD: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf");
+    const LILEX_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Italic.ttf");
+    const LILEX_BOLD_ITALIC: &[u8] =
+        include_bytes!("../../../assets/fonts/lilex/Lilex-BoldItalic.ttf");
+
+    fn read_u16_be(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_u32_be(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn write_u32_be(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn deterministic_ttc(faces: &[&[u8]]) -> Vec<u8> {
+        assert!(!faces.is_empty());
+        let header_len = 12 + 4 * faces.len();
+        let mut offsets = Vec::with_capacity(faces.len());
+        let mut total_len = header_len;
+        for face in faces {
+            total_len = (total_len + 3) & !3;
+            offsets.push(total_len);
+            total_len += face.len();
+        }
+        let mut collection = vec![0; total_len];
+        collection[0..4].copy_from_slice(b"ttcf");
+        write_u32_be(&mut collection, 4, 0x0001_0000);
+        write_u32_be(&mut collection, 8, faces.len() as u32);
+        for (index, (&face_offset, face)) in offsets.iter().zip(faces).enumerate() {
+            write_u32_be(&mut collection, 12 + 4 * index, face_offset as u32);
+            collection[face_offset..face_offset + face.len()].copy_from_slice(face);
+            let table_count = read_u16_be(face, 4) as usize;
+            for table_index in 0..table_count {
+                let record_offset = 12 + 16 * table_index;
+                let source_table_offset = read_u32_be(face, record_offset + 8);
+                write_u32_be(
+                    &mut collection,
+                    face_offset + record_offset + 8,
+                    source_table_offset + face_offset as u32,
+                );
+            }
+        }
+        collection
+    }
 
     fn css_subset_registry() -> CssFontFaceRegistry {
         CssFontFaceRegistry::new(
@@ -2553,6 +2617,61 @@ mod tests {
                     700..=700,
                     ranges,
                     "weight-700",
+                ),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn css_collection_registry() -> CssFontFaceRegistry {
+        let ranges: Arc<[CssUnicodeRange]> = Arc::from([
+            CssUnicodeRange::new(0x20, 0x20).unwrap(),
+            CssUnicodeRange::new('A' as u32, 'Z' as u32).unwrap(),
+        ]);
+        CssFontFaceRegistry::new(
+            vec![EmbeddedFontResource::new(
+                "collection",
+                Cow::Owned(deterministic_ttc(&[
+                    LILEX,
+                    LILEX_BOLD,
+                    LILEX_ITALIC,
+                    LILEX_BOLD_ITALIC,
+                ])),
+            )],
+            vec![
+                CssFontFace::new(
+                    "Waypath CSS Collection",
+                    FontStyle::Normal,
+                    400..=400,
+                    ranges.clone(),
+                    "collection",
+                ),
+                CssFontFace::new(
+                    "Waypath CSS Collection",
+                    FontStyle::Normal,
+                    700..=700,
+                    ranges,
+                    "collection",
+                ),
+                CssFontFace::new(
+                    "Waypath CSS Collection",
+                    FontStyle::Italic,
+                    400..=400,
+                    Arc::from([
+                        CssUnicodeRange::new(0x20, 0x20).unwrap(),
+                        CssUnicodeRange::new('A' as u32, 'Z' as u32).unwrap(),
+                    ]),
+                    "collection",
+                ),
+                CssFontFace::new(
+                    "Waypath CSS Collection",
+                    FontStyle::Italic,
+                    700..=700,
+                    Arc::from([
+                        CssUnicodeRange::new(0x20, 0x20).unwrap(),
+                        CssUnicodeRange::new('A' as u32, 'Z' as u32).unwrap(),
+                    ]),
+                    "collection",
                 ),
             ],
         )
@@ -2724,6 +2843,58 @@ mod tests {
             system.font_id(&italic).is_err(),
             "registered CSS families must not fall through to installed/system fonts"
         );
+    }
+
+    #[test]
+    fn css_face_registry_registers_every_face_in_one_embedded_collection() {
+        let devices = DirectXDevices::new().unwrap();
+        let system = DirectWriteTextSystem::new(&devices).unwrap();
+        system
+            .add_css_font_faces(css_collection_registry())
+            .unwrap();
+
+        let physical_face_key = |font: &gpui::Font| {
+            let font_id = system.font_id(font).unwrap();
+            system.state.read().fonts[font_id.0]
+                .font_face
+                .cast::<IUnknown>()
+                .unwrap()
+                .as_raw()
+                .addr()
+        };
+        let mut physical_regular = font(".GPUIEmbeddedFont.collection");
+        physical_regular.weight = FontWeight::NORMAL;
+        let mut physical_bold = font(".GPUIEmbeddedFont.collection");
+        physical_bold.weight = FontWeight::BOLD;
+        let mut physical_italic = font(".GPUIEmbeddedFont.collection");
+        physical_italic.style = FontStyle::Italic;
+        let mut physical_bold_italic = physical_italic.clone();
+        physical_bold_italic.weight = FontWeight::BOLD;
+        let regular_key = physical_face_key(&physical_regular);
+        let bold_key = physical_face_key(&physical_bold);
+        let italic_key = physical_face_key(&physical_italic);
+        let bold_italic_key = physical_face_key(&physical_bold_italic);
+        assert_ne!(regular_key, bold_key);
+        assert_eq!(
+            [regular_key, bold_key, italic_key, bold_italic_key]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
+
+        let mut public_regular = font("Waypath CSS Collection");
+        public_regular.weight = FontWeight::NORMAL;
+        let mut public_bold = font("Waypath CSS Collection");
+        public_bold.weight = FontWeight::BOLD;
+        let mut public_italic = font("Waypath CSS Collection");
+        public_italic.style = FontStyle::Italic;
+        let mut public_bold_italic = public_italic.clone();
+        public_bold_italic.weight = FontWeight::BOLD;
+        assert_eq!(physical_face_key(&public_regular), regular_key);
+        assert_eq!(physical_face_key(&public_bold), bold_key);
+        assert_eq!(physical_face_key(&public_italic), italic_key);
+        assert_eq!(physical_face_key(&public_bold_italic), bold_italic_key);
     }
 
     fn layout_with_spacing(
