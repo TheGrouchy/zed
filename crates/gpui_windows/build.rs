@@ -39,6 +39,7 @@ mod shader_compilation {
             "text_shadow_composite",
             "backdrop_horizontal",
             "backdrop_composite",
+            "soft_light_overlay",
             "underline",
             "monochrome_sprite",
             "subpixel_sprite",

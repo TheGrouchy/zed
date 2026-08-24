@@ -634,6 +634,10 @@ pub struct Scene {
     /// stream: the renderer breaks its render pass at each filter's order to
     /// snapshot the framebuffer before applying blur and saturation.
     pub backdrop_blurs: Vec<BackdropBlur>,
+    /// Destination-aware soft-light groups. Like backdrop filters, these sit
+    /// outside the primitive stream because their fragment shader samples the
+    /// framebuffer exactly where the overlay enters stacking order.
+    pub soft_light_overlays: Vec<SoftLightOverlay>,
     /// Atomic subtree groups whose children must be flattened before the
     /// linear alpha mask is applied once to the group result.
     pub linear_gradient_mask_groups: Vec<LinearGradientMaskGroup>,
@@ -694,6 +698,8 @@ pub enum LinearGradientMaskGroupError {
     UnbalancedLayer,
     /// Backdrop sampling needs a separate, explicitly defined group contract.
     BackdropBlur,
+    /// Destination-aware blending needs a separate group sampling contract.
+    SoftLightOverlay,
     /// Platform video surfaces cannot be sampled into the mask texture.
     Surface,
     /// A cached or manually inserted LCD sprite bypassed grayscale glyph rasterization.
@@ -713,6 +719,9 @@ impl fmt::Display for LinearGradientMaskGroupError {
             ),
             Self::UnbalancedLayer => write!(formatter, "linear mask group has an unbalanced layer"),
             Self::BackdropBlur => write!(formatter, "linear mask group contains a backdrop blur"),
+            Self::SoftLightOverlay => {
+                write!(formatter, "linear mask group contains a soft-light overlay")
+            }
             Self::Surface => write!(formatter, "linear mask group contains a platform surface"),
             Self::UnconvertedSubpixelText => {
                 write!(
@@ -748,6 +757,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
+        self.soft_light_overlays.clear();
         self.linear_gradient_mask_groups.clear();
         self.active_linear_gradient_mask_group = None;
         self.text_shadow_groups.clear();
@@ -825,6 +835,39 @@ impl Scene {
         self.backdrop_blurs.push(blur);
         self.paint_operations
             .push(PaintOperation::BackdropBlur(blur));
+    }
+
+    pub fn insert_soft_light_overlay(&mut self, mut overlay: SoftLightOverlay) {
+        if let Some(group) = self.active_linear_gradient_mask_group.as_mut() {
+            let previous_len = group.scene.len();
+            group.scene.insert_soft_light_overlay(overlay);
+            if group.scene.len() != previous_len {
+                self.paint_operations
+                    .push(PaintOperation::SoftLightOverlay(overlay));
+            }
+            return;
+        }
+        if let Some(group) = self.active_text_shadow_group.as_mut() {
+            let previous_len = group.scene.len();
+            group.scene.insert_soft_light_overlay(overlay);
+            if group.scene.len() != previous_len {
+                self.paint_operations
+                    .push(PaintOperation::SoftLightOverlay(overlay));
+            }
+            return;
+        }
+        let clipped_bounds = overlay.bounds.intersect(&overlay.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+        overlay.order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        self.soft_light_overlays.push(overlay);
+        self.paint_operations
+            .push(PaintOperation::SoftLightOverlay(overlay));
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -1036,6 +1079,7 @@ impl Scene {
         } else if !active.scene.layer_stack.is_empty() || active.scene.layer_underflowed {
             Err(TextShadowGroupError::UnbalancedLayer)
         } else if !active.scene.backdrop_blurs.is_empty()
+            || !active.scene.soft_light_overlays.is_empty()
             || !active.scene.quads.is_empty()
             || !active.scene.paths.is_empty()
             || !active.scene.underlines.is_empty()
@@ -1103,6 +1147,8 @@ impl Scene {
             Err(LinearGradientMaskGroupError::UnbalancedLayer)
         } else if !active.scene.backdrop_blurs.is_empty() {
             Err(LinearGradientMaskGroupError::BackdropBlur)
+        } else if !active.scene.soft_light_overlays.is_empty() {
+            Err(LinearGradientMaskGroupError::SoftLightOverlay)
         } else if !active.scene.surfaces.is_empty() {
             Err(LinearGradientMaskGroupError::Surface)
         } else if active.color_glyph_attempted {
@@ -1137,6 +1183,9 @@ impl Scene {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::BackdropBlur(blur) => self.insert_backdrop_blur(*blur),
+                PaintOperation::SoftLightOverlay(overlay) => {
+                    self.insert_soft_light_overlay(*overlay)
+                }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartLinearGradientMaskGroup(mask) => {
@@ -1176,6 +1225,8 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        self.soft_light_overlays
+            .sort_by_key(|overlay| overlay.order);
         self.linear_gradient_mask_groups
             .sort_by_key(|group| group.order);
         self.text_shadow_groups.sort_by_key(|group| group.order);
@@ -1240,6 +1291,7 @@ pub(crate) enum PrimitiveKind {
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     BackdropBlur(BackdropBlur),
+    SoftLightOverlay(SoftLightOverlay),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
     StartLinearGradientMaskGroup(LinearGradientMaskParams),
@@ -1685,6 +1737,32 @@ pub struct BackdropBlur {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+}
+
+/// A stack of three native backgrounds composited as one CSS background and
+/// then blended with the already-painted destination using `soft-light`.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct SoftLightOverlay {
+    pub order: DrawOrder,
+    pub opacity: f32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// CSS lists the topmost background first. The renderer composites this
+    /// array from index 2 back through index 0 before applying group opacity.
+    pub backgrounds: [Background; 3],
+}
+
+#[cfg(test)]
+mod soft_light_overlay_tests {
+    use super::*;
+
+    #[test]
+    fn soft_light_overlay_gpu_abi_is_locked() {
+        assert_eq!(std::mem::size_of::<SoftLightOverlay>(), 484);
+        assert_eq!(std::mem::align_of::<SoftLightOverlay>(), 4);
+    }
 }
 
 #[cfg(test)]

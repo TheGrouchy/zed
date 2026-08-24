@@ -968,6 +968,116 @@ float4 backdrop_composite_fragment(BackdropFilterVertexOutput input): SV_Target 
     return lerp(original, filtered, coverage);
 }
 
+/*
+**
+**              CSS soft-light overlay
+**
+*/
+
+struct SoftLightOverlay {
+    uint order;
+    float opacity;
+    Bounds bounds;
+    Bounds content_mask;
+    Background backgrounds[3];
+};
+
+StructuredBuffer<SoftLightOverlay> soft_light_overlays: register(t1);
+
+Bounds soft_light_visible_bounds(SoftLightOverlay overlay) {
+    float2 minimum = max(overlay.bounds.origin, overlay.content_mask.origin);
+    float2 maximum = min(
+        overlay.bounds.origin + overlay.bounds.size,
+        overlay.content_mask.origin + overlay.content_mask.size
+    );
+    minimum = clamp(minimum, float2(0.0, 0.0), global_viewport_size);
+    maximum = clamp(maximum, float2(0.0, 0.0), global_viewport_size);
+    Bounds visible;
+    visible.origin = minimum;
+    visible.size = max(maximum - minimum, float2(0.0, 0.0));
+    return visible;
+}
+
+struct SoftLightVertexOutput {
+    nointerpolation uint overlay_id: TEXCOORD0;
+    float4 position: SV_Position;
+};
+
+SoftLightVertexOutput soft_light_overlay_vertex(
+    uint vertex_id: SV_VertexID,
+    uint overlay_id: SV_InstanceID
+) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    SoftLightVertexOutput output;
+    output.overlay_id = overlay_id;
+    output.position = to_device_position(
+        unit_vertex,
+        soft_light_visible_bounds(soft_light_overlays[overlay_id])
+    );
+    return output;
+}
+
+float4 normal_source_over(float4 backdrop, float4 source) {
+    float alpha = source.a + backdrop.a * (1.0 - source.a);
+    if (alpha <= 0.000001) return float4(0.0, 0.0, 0.0, 0.0);
+    float3 premultiplied = source.rgb * source.a
+        + backdrop.rgb * backdrop.a * (1.0 - source.a);
+    return float4(premultiplied / alpha, alpha);
+}
+
+float soft_light_channel(float backdrop, float source) {
+    if (source <= 0.5) {
+        return backdrop - (1.0 - 2.0 * source) * backdrop * (1.0 - backdrop);
+    }
+    float d = backdrop <= 0.25
+        ? ((16.0 * backdrop - 12.0) * backdrop + 4.0) * backdrop
+        : sqrt(backdrop);
+    return backdrop + (2.0 * source - 1.0) * (d - backdrop);
+}
+
+float4 soft_light_source_over(float4 backdrop, float4 source) {
+    float3 blended = float3(
+        soft_light_channel(backdrop.r, source.r),
+        soft_light_channel(backdrop.g, source.g),
+        soft_light_channel(backdrop.b, source.b)
+    );
+    float alpha = source.a + backdrop.a * (1.0 - source.a);
+    if (alpha <= 0.000001) return float4(0.0, 0.0, 0.0, 0.0);
+
+    // W3C Compositing and Blending Level 1, source-over. `source_blend`
+    // includes the transparent-backdrop term before premultiplied compositing.
+    float3 source_blend = (1.0 - backdrop.a) * source.rgb + backdrop.a * blended;
+    float3 premultiplied = source.a * source_blend
+        + backdrop.a * (1.0 - source.a) * backdrop.rgb;
+    return float4(saturate(premultiplied / alpha), alpha);
+}
+
+float4 soft_light_overlay_fragment(SoftLightVertexOutput input): SV_Target {
+    SoftLightOverlay overlay = soft_light_overlays[input.overlay_id];
+    float4 source = float4(0.0, 0.0, 0.0, 0.0);
+
+    // CSS background lists are front-to-back. Compose the bottom layer first
+    // so index 0 remains the visible top layer.
+    [unroll]
+    for (int layer = 2; layer >= 0; --layer) {
+        Background background = overlay.backgrounds[layer];
+        float4 layer_color = gradient_color(
+            background,
+            input.position.xy,
+            overlay.bounds,
+            hsla_to_rgba(background.solid),
+            float4(0.0, 0.0, 0.0, 0.0),
+            float4(0.0, 0.0, 0.0, 0.0)
+        );
+        source = normal_source_over(source, saturate(layer_color));
+    }
+    source.a *= overlay.opacity;
+
+    float2 uv = input.position.xy / global_viewport_size;
+    float4 backdrop = t_sprite.SampleLevel(s_sprite, uv, 0.0);
+    return soft_light_source_over(saturate(backdrop), source);
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //

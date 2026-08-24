@@ -13,13 +13,13 @@ use crate::{
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
     PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
-    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextShadow, TextShadowGroupError,
-    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black, white,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, SoftLightOverlay,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextShadow,
+    TextShadowGroupError, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, profiler, px, rems, size, transparent_black, white,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -4157,6 +4157,48 @@ impl Window {
             content_mask,
             corner_radii: corner_radii.scale(scale_factor),
         });
+    }
+
+    /// Paint three CSS-ordered background layers with destination-aware
+    /// `mix-blend-mode: soft-light`. The background stack is first composited
+    /// normally, then `opacity` is applied to the whole group.
+    pub fn paint_soft_light_overlay(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        opacity: f32,
+        backgrounds: [Background; 3],
+    ) {
+        self.invalidator.debug_assert_paint();
+        assert!(
+            opacity.is_finite() && (0.0..=1.0).contains(&opacity),
+            "soft-light overlay opacity must be finite and in 0..=1"
+        );
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask().scale(scale_factor);
+        let scaled_bounds = bounds.scale(scale_factor);
+        // Force a primitive boundary so the renderer can snapshot after all
+        // lower content and before any subsequently painted overlay chrome.
+        self.next_frame.scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.),
+            bounds: scaled_bounds,
+            corner_radii: Corners::default(),
+            content_mask,
+            color: crate::transparent_black(),
+            element_bounds: scaled_bounds,
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+        });
+        self.next_frame
+            .scene
+            .insert_soft_light_overlay(SoftLightOverlay {
+                order: 0,
+                opacity,
+                bounds: scaled_bounds,
+                content_mask,
+                backgrounds,
+            });
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.

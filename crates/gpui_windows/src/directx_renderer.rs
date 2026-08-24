@@ -105,6 +105,7 @@ struct DirectXRenderPipelines {
     text_shadow_composite_pipeline: PipelineState<ScaledTextShadow>,
     backdrop_horizontal_pipeline: PipelineState<BackdropBlur>,
     backdrop_composite_pipeline: PipelineState<BackdropBlur>,
+    soft_light_overlay_pipeline: PipelineState<SoftLightOverlay>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
@@ -378,12 +379,35 @@ impl DirectXRenderer {
         annotation: Option<&ID3DUserDefinedAnnotation>,
     ) -> Result<()> {
         let mut pending_backdrop_filters = scene.backdrop_blurs.iter().peekable();
+        let mut pending_soft_light_overlays = scene.soft_light_overlays.iter().peekable();
         for batch in scene.batches() {
-            while pending_backdrop_filters
-                .peek()
-                .is_some_and(|filter| filter.order <= batch_first_order(scene, &batch))
-            {
-                self.draw_backdrop_filter(pending_backdrop_filters.next().unwrap(), target_view)?;
+            let batch_order = batch_first_order(scene, &batch);
+            loop {
+                let filter_order = pending_backdrop_filters.peek().map(|filter| filter.order);
+                let overlay_order = pending_soft_light_overlays
+                    .peek()
+                    .map(|overlay| overlay.order);
+                match (filter_order, overlay_order) {
+                    (Some(filter), Some(overlay)) if filter <= overlay && filter <= batch_order => {
+                        self.draw_backdrop_filter(
+                            pending_backdrop_filters.next().unwrap(),
+                            target_view,
+                        )?;
+                    }
+                    (_, Some(overlay)) if overlay <= batch_order => {
+                        self.draw_soft_light_overlay(
+                            pending_soft_light_overlays.next().unwrap(),
+                            target_view,
+                        )?;
+                    }
+                    (Some(filter), None) if filter <= batch_order => {
+                        self.draw_backdrop_filter(
+                            pending_backdrop_filters.next().unwrap(),
+                            target_view,
+                        )?;
+                    }
+                    _ => break,
+                }
             }
             let _annotation = annotation
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -447,8 +471,22 @@ impl DirectXRenderer {
                 )
             })?;
         }
-        for filter in pending_backdrop_filters {
-            self.draw_backdrop_filter(filter, target_view)?;
+        loop {
+            let filter_order = pending_backdrop_filters.peek().map(|filter| filter.order);
+            let overlay_order = pending_soft_light_overlays
+                .peek()
+                .map(|overlay| overlay.order);
+            match (filter_order, overlay_order) {
+                (Some(filter), Some(overlay)) if filter <= overlay => self
+                    .draw_backdrop_filter(pending_backdrop_filters.next().unwrap(), target_view)?,
+                (_, Some(_)) => self.draw_soft_light_overlay(
+                    pending_soft_light_overlays.next().unwrap(),
+                    target_view,
+                )?,
+                (Some(_), None) => self
+                    .draw_backdrop_filter(pending_backdrop_filters.next().unwrap(), target_view)?,
+                (None, None) => break,
+            }
         }
         Ok(())
     }
@@ -952,6 +990,60 @@ impl DirectXRenderer {
             )
     }
 
+    /// Snapshot the current destination and replace the overlay bounds with
+    /// an exact shader-composited CSS soft-light result. Blending stays
+    /// disabled because the fragment shader performs both the blend function
+    /// and source-over alpha math against that snapshot.
+    fn draw_soft_light_overlay(
+        &mut self,
+        overlay: &SoftLightOverlay,
+        parent_target: &Option<ID3D11RenderTargetView>,
+    ) -> Result<()> {
+        let (render_target, snapshot_texture, snapshot_srv, viewport) = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            (
+                resources
+                    .render_target
+                    .clone()
+                    .context("missing render target texture")?,
+                resources.backdrop_snapshot_texture.clone(),
+                resources.backdrop_snapshot_srv.clone(),
+                resources.viewport,
+            )
+        };
+        let (device, device_context) = {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            (devices.device.clone(), devices.device_context.clone())
+        };
+
+        self.pipelines.soft_light_overlay_pipeline.update_buffer(
+            &device,
+            &device_context,
+            slice::from_ref(overlay),
+        )?;
+
+        unsafe {
+            device_context.PSSetShaderResources(0, Some(&[None]));
+            device_context.VSSetShaderResources(0, Some(&[None]));
+            device_context.PSSetShaderResources(2, Some(&[None]));
+            device_context.VSSetShaderResources(2, Some(&[None]));
+            device_context.OMSetRenderTargets(None, None);
+            device_context.CopyResource(&snapshot_texture, &render_target);
+            device_context.OMSetRenderTargets(Some(slice::from_ref(parent_target)), None);
+        }
+
+        self.pipelines
+            .soft_light_overlay_pipeline
+            .draw_with_texture(
+                &device_context,
+                slice::from_ref(&snapshot_srv),
+                slice::from_ref(&viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.clamp_sampler),
+                1,
+            )
+    }
+
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
         if len == 0 {
             return Ok(());
@@ -1276,6 +1368,13 @@ impl DirectXRenderPipelines {
             1,
             create_blend_state_disabled(device)?,
         )?;
+        let soft_light_overlay_pipeline = PipelineState::new(
+            device,
+            "soft_light_overlay_pipeline",
+            ShaderModule::SoftLightOverlay,
+            1,
+            create_blend_state_disabled(device)?,
+        )?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
@@ -1315,6 +1414,7 @@ impl DirectXRenderPipelines {
             text_shadow_composite_pipeline,
             backdrop_horizontal_pipeline,
             backdrop_composite_pipeline,
+            soft_light_overlay_pipeline,
             underline_pipeline,
             mono_sprites,
             subpixel_sprites,
@@ -2155,6 +2255,7 @@ pub(crate) mod shader_resources {
         TextShadowComposite,
         BackdropHorizontal,
         BackdropComposite,
+        SoftLightOverlay,
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
@@ -2239,6 +2340,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::BackdropComposite => match target {
                     ShaderTarget::Vertex => BACKDROP_COMPOSITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => BACKDROP_COMPOSITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::SoftLightOverlay => match target {
+                    ShaderTarget::Vertex => SOFT_LIGHT_OVERLAY_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SOFT_LIGHT_OVERLAY_FRAGMENT_BYTES,
                 },
                 ShaderModule::MonochromeSprite => match target {
                     ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
@@ -2344,6 +2449,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::TextShadowComposite => "text_shadow_composite",
                 ShaderModule::BackdropHorizontal => "backdrop_horizontal",
                 ShaderModule::BackdropComposite => "backdrop_composite",
+                ShaderModule::SoftLightOverlay => "soft_light_overlay",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
@@ -2399,6 +2505,26 @@ pub(crate) mod shader_resources {
                 build_shader_blob(module, ShaderTarget::Fragment)
                     .expect("backdrop-filter fragment shader must compile");
             }
+        }
+
+        #[test]
+        fn soft_light_overlay_shaders_compile_with_fxc() {
+            build_shader_blob(ShaderModule::SoftLightOverlay, ShaderTarget::Vertex)
+                .expect("soft-light vertex shader must compile");
+            build_shader_blob(ShaderModule::SoftLightOverlay, ShaderTarget::Fragment)
+                .expect("soft-light fragment shader must compile");
+        }
+
+        #[test]
+        fn soft_light_overlay_keeps_the_css_blend_and_layer_contract() {
+            let shader = include_str!("shaders.hlsl");
+            let renderer = include_str!("directx_renderer.rs");
+            assert!(shader.contains("if (source <= 0.5)"));
+            assert!(shader.contains("backdrop <= 0.25"));
+            assert!(shader.contains("soft_light_source_over"));
+            assert!(shader.contains("for (int layer = 2; layer >= 0; --layer)"));
+            assert!(renderer.contains("CopyResource(&snapshot_texture, &render_target)"));
+            assert!(renderer.contains("create_blend_state_disabled(device)?"));
         }
 
         #[test]
