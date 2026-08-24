@@ -108,6 +108,7 @@ struct DirectWriteState {
     layout_line_scratch: Vec<u16>,
     css_font_faces: Vec<RegisteredCssFontFace>,
     css_resource_aliases: HashMap<String, RegisteredCssFontResource>,
+    system_face_aliases: BTreeSet<String>,
 }
 
 impl GPUState {
@@ -344,6 +345,7 @@ impl DirectWriteTextSystem {
                 layout_line_scratch: Vec::new(),
                 css_font_faces: Vec::new(),
                 css_resource_aliases: HashMap::default(),
+                system_face_aliases: BTreeSet::new(),
             }),
         })
     }
@@ -437,6 +439,108 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 }
 
 impl DirectWriteState {
+    fn ensure_system_face_alias(
+        &mut self,
+        components: &DirectWriteComponents,
+        alias: &str,
+    ) -> Result<bool> {
+        if alias.is_empty()
+            || matches!(
+                alias,
+                "system-ui"
+                    | "sans-serif"
+                    | "ui-monospace"
+                    | "monospace"
+                    | "serif"
+                    | "cursive"
+                    | "fantasy"
+            )
+            || self.system_face_aliases.contains(alias)
+        {
+            return Ok(false);
+        }
+
+        let alias_h = HSTRING::from(alias);
+        for collection in [&self.custom_font_collection, &self.system_font_collection] {
+            let mut index = 0;
+            let mut exists = BOOL::default();
+            unsafe { collection.FindFamilyName(&alias_h, &mut index, &mut exists)? };
+            if exists.as_bool() {
+                return Ok(false);
+            }
+        }
+
+        let font_set = unsafe { self.system_font_collection.GetFontSet()? };
+        let mut physical_faces = BTreeSet::new();
+        let mut added = false;
+        for property_id in [
+            DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+            DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME,
+        ] {
+            let property = DWRITE_FONT_PROPERTY {
+                propertyId: property_id,
+                propertyValue: PCWSTR(alias_h.as_ptr()),
+                localeName: PCWSTR::null(),
+            };
+            let matches = unsafe { font_set.GetMatchingFonts2(&[property])? };
+            for index in 0..unsafe { matches.GetFontCount() } {
+                let face_reference = unsafe { matches.GetFontFaceReference(index)? };
+                let key = face_reference.cast::<IUnknown>()?.as_raw().addr();
+                if !physical_faces.insert(key) {
+                    continue;
+                }
+                let face: IDWriteFontFace5 = unsafe { face_reference.CreateFontFace()?.cast()? };
+                let weight = HSTRING::from(unsafe { face.GetWeight().0 }.to_string());
+                let stretch = HSTRING::from(unsafe { face.GetStretch().0 }.to_string());
+                let style = HSTRING::from(unsafe { face.GetStyle().0 }.to_string());
+                let properties = [
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_FAMILY_NAME,
+                        propertyValue: PCWSTR(alias_h.as_ptr()),
+                        localeName: DEFAULT_LOCALE_NAME,
+                    },
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_FULL_NAME,
+                        propertyValue: PCWSTR(alias_h.as_ptr()),
+                        localeName: DEFAULT_LOCALE_NAME,
+                    },
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_WEIGHT,
+                        propertyValue: PCWSTR(weight.as_ptr()),
+                        localeName: PCWSTR::null(),
+                    },
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_STRETCH,
+                        propertyValue: PCWSTR(stretch.as_ptr()),
+                        localeName: PCWSTR::null(),
+                    },
+                    DWRITE_FONT_PROPERTY {
+                        propertyId: DWRITE_FONT_PROPERTY_ID_STYLE,
+                        propertyValue: PCWSTR(style.as_ptr()),
+                        localeName: PCWSTR::null(),
+                    },
+                ];
+                unsafe {
+                    components
+                        .builder
+                        .AddFontFaceReference(&face_reference, &properties)?;
+                }
+                added = true;
+            }
+        }
+        if added {
+            let set = unsafe { components.builder.CreateFontSet()? };
+            self.custom_font_collection = unsafe {
+                DirectWriteTextSystem::create_weight_stretch_style_collection(
+                    &components.factory,
+                    &set,
+                )?
+            };
+            self.system_face_aliases.insert(alias.to_string());
+        }
+        Ok(added)
+    }
+
     fn css_weight_rank(requested: u16, start: u16, end: u16) -> (u8, u16) {
         if (start..=end).contains(&requested) {
             return (0, 0);
@@ -496,6 +600,64 @@ impl DirectWriteState {
         requested_weight.clamp(face.weight_start, face.weight_end)
     }
 
+    fn css_fallback_family<'a>(
+        family_name: &'a str,
+        system_ui_font_name: &'a SharedString,
+    ) -> &'a str {
+        match family_name {
+            "system-ui" => system_ui_font_name.as_ref(),
+            "sans-serif" => "Arial",
+            "ui-monospace" | "monospace" => "Consolas",
+            "serif" => "Times New Roman",
+            "cursive" => "Comic Sans MS",
+            "fantasy" => "Impact",
+            _ => family_name,
+        }
+    }
+
+    fn font_has_character(&self, font_id: FontId, character: char) -> bool {
+        let codepoint = character as u32;
+        let mut glyph = 0u16;
+        unsafe {
+            self.fonts[font_id.0]
+                .font_face
+                .GetGlyphIndices(&raw const codepoint, 1, &raw mut glyph)
+                .is_ok()
+                && glyph != 0
+        }
+    }
+
+    fn select_explicit_css_fallback(
+        &mut self,
+        components: &DirectWriteComponents,
+        request: &CssFontRequest,
+        character: char,
+    ) -> Option<FontId> {
+        let fallback_names = request
+            .source_font
+            .fallbacks
+            .as_ref()?
+            .fallback_list()
+            .to_vec();
+        for fallback in fallback_names {
+            let mut physical_font = request.source_font.clone();
+            physical_font.family =
+                Self::css_fallback_family(fallback.as_str(), &components.system_ui_font_name)
+                    .to_string()
+                    .into();
+            physical_font.fallbacks = None;
+            let physical_id = self
+                .font_to_font_id
+                .get(&physical_font)
+                .copied()
+                .or_else(|| self.select_and_cache_font(components, &physical_font));
+            if physical_id.is_some_and(|font_id| self.font_has_character(font_id, character)) {
+                return physical_id;
+            }
+        }
+        None
+    }
+
     fn make_css_font_info(
         &self,
         components: &DirectWriteComponents,
@@ -538,6 +700,12 @@ impl DirectWriteState {
         components: &DirectWriteComponents,
         font: &Font,
     ) -> Option<FontId> {
+        if let Some(fallbacks) = &font.fallbacks {
+            for fallback in fallbacks.fallback_list() {
+                self.ensure_system_face_alias(components, fallback)
+                    .log_err();
+            }
+        }
         let select_font = |this: &mut DirectWriteState, font: &Font| -> Option<FontId> {
             let is_registered_css_family = this
                 .css_font_faces
@@ -1014,32 +1182,41 @@ impl DirectWriteState {
                 })
                 .context("registered CSS request lost its default physical face")?
                 .clone();
-            let physical_faces = run_text
-                .chars()
-                .map(|character| {
-                    self.select_css_face(
+            let mut previous_was_whitespace = None;
+            for character in run_text.chars() {
+                let face = self
+                    .select_css_face(
                         &request.family,
                         request.style,
                         request.weight,
                         Some(character),
                     )
-                    .cloned()
-                    .unwrap_or_else(|| default_face.clone())
-                })
-                .collect::<Vec<_>>();
-
-            let mut previous_was_whitespace = None;
-            for (character, face) in run_text.chars().zip(physical_faces) {
-                let mut physical_font = request.source_font.clone();
-                physical_font.family = face.native_family_alias.clone();
-                physical_font.weight =
-                    FontWeight(Self::css_face_weight(&face, request.weight) as f32);
-                let physical_id = self
-                    .font_to_font_id
-                    .get(&physical_font)
-                    .copied()
-                    .or_else(|| self.select_and_cache_font(components, &physical_font))
-                    .context("failed to select the locked CSS subset face")?;
+                    .cloned();
+                let physical_id = if let Some(face) = face {
+                    let mut physical_font = request.source_font.clone();
+                    physical_font.family = face.native_family_alias.clone();
+                    physical_font.weight =
+                        FontWeight(Self::css_face_weight(&face, request.weight) as f32);
+                    self.font_to_font_id
+                        .get(&physical_font)
+                        .copied()
+                        .or_else(|| self.select_and_cache_font(components, &physical_font))
+                        .context("failed to select the locked CSS subset face")?
+                } else if let Some(fallback_id) =
+                    self.select_explicit_css_fallback(components, &request, character)
+                {
+                    fallback_id
+                } else {
+                    let mut physical_font = request.source_font.clone();
+                    physical_font.family = default_face.native_family_alias.clone();
+                    physical_font.weight =
+                        FontWeight(Self::css_face_weight(&default_face, request.weight) as f32);
+                    self.font_to_font_id
+                        .get(&physical_font)
+                        .copied()
+                        .or_else(|| self.select_and_cache_font(components, &physical_font))
+                        .context("failed to select the locked CSS fallback face")?
+                };
                 let byte_len = character.len_utf8();
                 let is_whitespace = character.is_whitespace();
                 if let Some(previous) = materialized.last_mut()
@@ -1088,15 +1265,8 @@ impl DirectWriteState {
                 // stack such as `system-ui, sans-serif` behaves like
                 // Chromium instead of silently falling through to the
                 // process-wide DirectWrite fallback order.
-                let resolved_family = match family_name.as_str() {
-                    "system-ui" => system_ui_font_name.as_ref(),
-                    "sans-serif" => "Arial",
-                    "ui-monospace" | "monospace" => "Consolas",
-                    "serif" => "Times New Roman",
-                    "cursive" => "Comic Sans MS",
-                    "fantasy" => "Impact",
-                    _ => family_name.as_str(),
-                };
+                let resolved_family =
+                    Self::css_fallback_family(family_name.as_str(), system_ui_font_name);
                 let family_name = HSTRING::from(resolved_family);
                 let selected = [custom_font_collection, system_font_collection]
                     .into_iter()
@@ -3353,6 +3523,32 @@ mod tests {
                 .map(|run| run.glyphs.len())
                 .collect::<Vec<_>>()
         );
+
+        // CSS family stacks are priority ordered. This fixture is deliberately
+        // outside the embedded face's unicode range so the measured advance
+        // proves that `Arial Black` wins over the later generic sans fallback,
+        // matching Chromium on Windows.
+        let fallback_text = "Москва Кириллица №";
+        let fallback_layout = |fallbacks: Vec<String>| {
+            let mut display = font("Waypath CSS Subset");
+            display.weight = FontWeight::MEDIUM;
+            display.fallbacks = Some(FontFallbacks::from_fonts(fallbacks));
+            system.layout_line(
+                fallback_text,
+                Pixels::from(32.0),
+                &[FontRun {
+                    len: fallback_text.len(),
+                    font_id: system.font_id(&display).unwrap(),
+                    letter_spacing: Pixels::ZERO,
+                }],
+            )
+        };
+        let black_only = fallback_layout(vec!["Arial Black".to_string()]);
+        let black_then_generic =
+            fallback_layout(vec!["Arial Black".to_string(), "sans-serif".to_string()]);
+        let generic_only = fallback_layout(vec!["sans-serif".to_string()]);
+        assert_eq!(black_then_generic.width, black_only.width);
+        assert_ne!(black_then_generic.width, generic_only.width);
     }
 
     #[test]
