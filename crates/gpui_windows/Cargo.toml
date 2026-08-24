@@ -35,6 +35,7 @@ parking_lot.workspace = true
 rand.workspace = true
 raw-window-handle.workspace = true
 smallvec.workspace = true
+ttf-parser = "0.25"
 uuid.workspace = true
 windows.workspace = true
 windows-core.workspace = true

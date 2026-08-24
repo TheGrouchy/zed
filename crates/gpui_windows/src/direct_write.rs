@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::{c_uint, c_void},
     mem::ManuallyDrop,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -38,6 +39,7 @@ struct FontInfo {
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
     css_request: Option<CssFontRequest>,
+    composite_advance_corrections: Arc<BTreeMap<u16, i16>>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,11 +59,144 @@ struct RegisteredCssFontFace {
     unicode_ranges: Vec<CssUnicodeRange>,
     native_family_alias: SharedString,
     supports_weight_axis: bool,
+    font_data: Cow<'static, [u8]>,
 }
 
 struct RegisteredCssFontResource {
     native_family_alias: SharedString,
     supports_weight_axis: bool,
+    font_data: Cow<'static, [u8]>,
+}
+
+fn read_be_u16(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        data.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// DirectWrite applies the composite glyph's HVAR advance even when a TrueType
+/// component carries USE_MY_METRICS. Chromium honors that flag and advances by
+/// the designated component instead. Preserve the font-authored relationship
+/// so the layout path can correct DirectWrite without a font- or glyph-specific
+/// metric table.
+fn use_my_metrics_glyphs(data: &[u8]) -> Arc<BTreeMap<u16, u16>> {
+    const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+    const WE_HAVE_A_SCALE: u16 = 0x0008;
+    const MORE_COMPONENTS: u16 = 0x0020;
+    const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+    const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+    const USE_MY_METRICS: u16 = 0x0200;
+
+    let Some(face) = ttf_parser::Face::parse(data, 0).ok() else {
+        return Arc::default();
+    };
+    let Some(head) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"head")) else {
+        return Arc::default();
+    };
+    let Some(maxp) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"maxp")) else {
+        return Arc::default();
+    };
+    let Some(loca) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"loca")) else {
+        return Arc::default();
+    };
+    let Some(glyf) = face.raw_face().table(ttf_parser::Tag::from_bytes(b"glyf")) else {
+        return Arc::default();
+    };
+    let Some(index_to_loc_format) = read_be_u16(head, 50) else {
+        return Arc::default();
+    };
+    let Some(glyph_count) = read_be_u16(maxp, 4) else {
+        return Arc::default();
+    };
+    let glyph_offset = |glyph_id: u16| -> Option<usize> {
+        match index_to_loc_format {
+            0 => Some(usize::from(read_be_u16(loca, usize::from(glyph_id) * 2)?) * 2),
+            1 => usize::try_from(read_be_u32(loca, usize::from(glyph_id) * 4)?).ok(),
+            _ => None,
+        }
+    };
+
+    let mut result = BTreeMap::new();
+    for glyph_id in 0..glyph_count {
+        let Some(start) = glyph_offset(glyph_id) else {
+            continue;
+        };
+        let Some(end) = glyph_offset(glyph_id + 1) else {
+            continue;
+        };
+        let Some(glyph) = glyf.get(start..end) else {
+            continue;
+        };
+        if glyph.len() < 14 || read_be_u16(glyph, 0).is_none_or(|contours| contours < 0x8000) {
+            continue;
+        }
+
+        let mut offset = 10usize;
+        loop {
+            let Some(flags) = read_be_u16(glyph, offset) else {
+                break;
+            };
+            let Some(component) = read_be_u16(glyph, offset + 2) else {
+                break;
+            };
+            if flags & USE_MY_METRICS != 0 {
+                result.insert(glyph_id, component);
+            }
+            offset += 4;
+            offset += if flags & ARG_1_AND_2_ARE_WORDS != 0 {
+                4
+            } else {
+                2
+            };
+            offset += if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
+                8
+            } else if flags & WE_HAVE_AN_X_AND_Y_SCALE != 0 {
+                4
+            } else if flags & WE_HAVE_A_SCALE != 0 {
+                2
+            } else {
+                0
+            };
+            if flags & MORE_COMPONENTS == 0 {
+                break;
+            }
+        }
+    }
+    Arc::new(result)
+}
+
+fn use_my_metrics_advance_corrections(data: &[u8], weight: u16) -> Arc<BTreeMap<u16, i16>> {
+    let metric_glyphs = use_my_metrics_glyphs(data);
+    if metric_glyphs.is_empty() {
+        return Arc::default();
+    }
+    let Some(mut face) = ttf_parser::Face::parse(data, 0).ok() else {
+        return Arc::default();
+    };
+    let _ = face.set_variation(ttf_parser::Tag::from_bytes(b"wght"), weight as f32);
+    let mut corrections = BTreeMap::new();
+    for (glyph, metric_glyph) in metric_glyphs.iter() {
+        let Some(glyph_advance) = face.glyph_hor_advance(ttf_parser::GlyphId(*glyph)) else {
+            continue;
+        };
+        let Some(metric_advance) = face.glyph_hor_advance(ttf_parser::GlyphId(*metric_glyph))
+        else {
+            continue;
+        };
+        let correction = i32::from(metric_advance) - i32::from(glyph_advance);
+        if correction != 0
+            && let Ok(correction) = i16::try_from(correction)
+        {
+            corrections.insert(*glyph, correction);
+        }
+    }
+    Arc::new(corrections)
 }
 
 pub(crate) struct DirectWriteTextSystem {
@@ -573,7 +708,7 @@ impl DirectWriteState {
         requested_weight: u16,
         character: Option<char>,
     ) -> Option<&RegisteredCssFontFace> {
-        let mut best = None::<((u8, u16), usize, &RegisteredCssFontFace)>;
+        let mut best = None::<((u8, u16), u32, usize, &RegisteredCssFontFace)>;
         for (source_order, face) in self.css_font_faces.iter().enumerate() {
             if face.family.as_ref() != family
                 || face.style != style
@@ -587,13 +722,24 @@ impl DirectWriteState {
                 continue;
             }
             let rank = Self::css_weight_rank(requested_weight, face.weight_start, face.weight_end);
-            if best.is_none_or(|(best_rank, best_order, _)| {
-                rank < best_rank || (rank == best_rank && source_order > best_order)
+            let unicode_span = character
+                .and_then(|character| {
+                    face.unicode_ranges
+                        .iter()
+                        .filter(|range| range.contains(character))
+                        .map(|range| range.end() - range.start())
+                        .min()
+                })
+                .unwrap_or(u32::MAX);
+            if best.is_none_or(|(best_rank, best_span, best_order, _)| {
+                rank < best_rank
+                    || (rank == best_rank && unicode_span < best_span)
+                    || (rank == best_rank && unicode_span == best_span && source_order > best_order)
             }) {
-                best = Some((rank, source_order, face));
+                best = Some((rank, unicode_span, source_order, face));
             }
         }
-        best.map(|(_, _, face)| face)
+        best.map(|(_, _, _, face)| face)
     }
 
     fn css_face_weight(face: &RegisteredCssFontFace, requested_weight: u16) -> u16 {
@@ -739,6 +885,8 @@ impl DirectWriteState {
                 &components.system_ui_font_name,
             )?
         };
+        info.composite_advance_corrections =
+            use_my_metrics_advance_corrections(face.font_data.as_ref(), weight);
         info.css_request = Some(CssFontRequest {
             family: font.family.clone(),
             style: font.style,
@@ -764,7 +912,7 @@ impl DirectWriteState {
                 .css_font_faces
                 .iter()
                 .any(|face| face.family == font.family);
-            let info = if is_registered_css_family {
+            let mut info = if is_registered_css_family {
                 this.make_css_font_info(components, font)?
             } else {
                 [&this.custom_font_collection, &this.system_font_collection]
@@ -780,6 +928,15 @@ impl DirectWriteState {
                         )
                     })?
             };
+            if let Some(resource) = this
+                .css_resource_aliases
+                .values()
+                .find(|resource| resource.native_family_alias == font.family)
+            {
+                let rounded_weight = font.weight.0.round().clamp(1.0, 1000.0) as u16;
+                info.composite_advance_corrections =
+                    use_my_metrics_advance_corrections(resource.font_data.as_ref(), rounded_weight);
+            }
 
             let font_id = FontId(this.fonts.len());
             let font_face_key = info.font_face.cast::<IUnknown>().unwrap().as_raw().addr();
@@ -1014,6 +1171,7 @@ impl DirectWriteState {
                 RegisteredCssFontResource {
                     native_family_alias: native_alias,
                     supports_weight_axis,
+                    font_data: resource.bytes().clone(),
                 },
             );
         }
@@ -1072,6 +1230,7 @@ impl DirectWriteState {
                 unicode_ranges: face.unicode_ranges().to_vec(),
                 native_family_alias: resource.native_family_alias.clone(),
                 supports_weight_axis: resource.supports_weight_axis,
+                font_data: resource.font_data.clone(),
             });
         }
 
@@ -1194,6 +1353,72 @@ impl DirectWriteState {
         ensure!(
             utf8_start == text.len(),
             "font runs cover {utf8_start} bytes but source contains {} bytes",
+            text.len()
+        );
+        Ok(())
+    }
+
+    unsafe fn apply_use_my_metrics_spacing(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+        layout: &IDWriteTextLayout1,
+    ) -> Result<()> {
+        let mut utf8_start = 0usize;
+        let mut utf16_start = 0u32;
+        for run in font_runs {
+            let utf8_end = utf8_start + run.len;
+            ensure!(
+                utf8_end <= text.len()
+                    && text.is_char_boundary(utf8_start)
+                    && text.is_char_boundary(utf8_end),
+                "font run splits source text while applying composite metrics"
+            );
+            let run_text = &text[utf8_start..utf8_end];
+            let font_info = &self.fonts[run.font_id.0];
+            if font_info.composite_advance_corrections.is_empty() {
+                utf8_start = utf8_end;
+                utf16_start += run_text.encode_utf16().count() as u32;
+                continue;
+            }
+
+            let mut font_metrics = unsafe { std::mem::zeroed() };
+            unsafe { font_info.font_face.GetMetrics(&mut font_metrics) };
+            let units_per_em = font_metrics.Base.designUnitsPerEm as f32;
+            let mut position = utf16_start;
+            for character in run_text.chars() {
+                let codepoint = character as u32;
+                let mut glyph_id = 0u16;
+                unsafe {
+                    font_info.font_face.GetGlyphIndices(
+                        &raw const codepoint,
+                        1,
+                        &raw mut glyph_id,
+                    )?;
+                }
+                if let Some(correction) = font_info.composite_advance_corrections.get(&glyph_id) {
+                    let correction = f32::from(*correction) * font_size.as_f32() / units_per_em;
+                    unsafe {
+                        layout.SetCharacterSpacing(
+                            0.0,
+                            run.letter_spacing.as_f32() + correction,
+                            0.0,
+                            DWRITE_TEXT_RANGE {
+                                startPosition: position,
+                                length: character.len_utf16() as u32,
+                            },
+                        )?;
+                    }
+                }
+                position += character.len_utf16() as u32;
+            }
+            utf8_start = utf8_end;
+            utf16_start = position;
+        }
+        ensure!(
+            utf8_start == text.len(),
+            "font runs cover {utf8_start} bytes but source contains {}",
             text.len()
         );
         Ok(())
@@ -1503,6 +1728,7 @@ impl DirectWriteState {
                     fallbacks,
                     font_collection: collection.clone(),
                     css_request: None,
+                    composite_advance_corrections: Arc::default(),
                 };
                 Some(font_info)
             });
@@ -1655,6 +1881,7 @@ impl DirectWriteState {
             }
 
             self.apply_css_face_ranges(text, font_runs, &text_layout)?;
+            self.apply_use_my_metrics_spacing(text, font_size, font_runs, &text_layout)?;
 
             let (ascent, descent) = if let Some(metrics) = css_line_metrics {
                 metrics
@@ -3063,7 +3290,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::DirectXDevices;
-    use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
+    use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem, use_my_metrics_glyphs};
     use gpui::{
         CssFontFace, CssFontFaceRegistry, CssUnicodeRange, EmbeddedFontResource, Font,
         FontFallbacks, FontRun, FontStyle, FontWeight, Pixels, PlatformTextSystem, TextRun,
@@ -3691,6 +3918,11 @@ mod tests {
 
     #[test]
     fn css_variable_face_interpolates_the_locked_unnamed_space_grotesk_600_axis() {
+        assert_eq!(
+            use_my_metrics_glyphs(SPACE_GROTESK_VIETNAMESE).get(&57),
+            Some(&8),
+            "locked Vietnamese face must preserve Ohorn USE_MY_METRICS"
+        );
         let devices = DirectXDevices::new().unwrap();
         let system = DirectWriteTextSystem::new(&devices).unwrap();
         system
@@ -3702,6 +3934,19 @@ mod tests {
                 SPACE_GROTESK_VIETNAMESE,
             ))
             .unwrap();
+
+        {
+            let state = system.state.read();
+            let vietnamese_face = state
+                .select_css_face("Waypath Space Grotesk", FontStyle::Normal, 600, Some('Ơ'))
+                .unwrap();
+            assert!(
+                vietnamese_face
+                    .native_family_alias
+                    .contains("waypath-vietnamese"),
+                "narrow Vietnamese unicode-range must win over broad latin-ext"
+            );
+        }
 
         assert_chromium_metric(
             &system,
@@ -3718,6 +3963,24 @@ mod tests {
             600,
             "ÀÁÂÃÄÅ Ç ÈÉÊË ÌÍÎÏ Ñ ÒÓÔÕÖ Ø ÙÚÛÜ Ý ß Œ œ Ž ž € ™ → −",
             851.5699,
+            31.0,
+            9.0,
+        );
+        assert_chromium_metric(
+            &system,
+            "Waypath Space Grotesk",
+            600,
+            "Ơ",
+            21.568,
+            31.0,
+            9.0,
+        );
+        assert_chromium_metric(
+            &system,
+            "Waypath Space Grotesk",
+            600,
+            "Ă ă Đ đ Ĩ ĩ Ũ ũ Ơ ơ Ư ư Ạ ạ Ế ế Ỳ ỳ ₫",
+            509.7276,
             31.0,
             9.0,
         );
