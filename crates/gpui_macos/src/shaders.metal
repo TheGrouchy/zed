@@ -1747,5 +1747,17 @@ fragment float4 backdrop_blur_fragment(
   // before this pass — one clean sample. The snapshot covers only
   // source_rect (x, y, w, h) of the drawable, not the whole viewport.
   float2 uv = (input.position.xy - source_rect.xy) / source_rect.zw;
-  return source_texture.sample(source_sampler, uv);
+  float4 color = source_texture.sample(source_sampler, uv);
+  float saturation = blur.saturation;
+  float3 saturated = float3(
+      dot(color.rgb, float3(0.213 + 0.787 * saturation,
+                            0.715 - 0.715 * saturation,
+                            0.072 - 0.072 * saturation)),
+      dot(color.rgb, float3(0.213 - 0.213 * saturation,
+                            0.715 + 0.285 * saturation,
+                            0.072 - 0.072 * saturation)),
+      dot(color.rgb, float3(0.213 - 0.213 * saturation,
+                            0.715 - 0.715 * saturation,
+                            0.072 + 0.928 * saturation)));
+  return float4(clamp(saturated, 0.0, 1.0), color.a);
 }

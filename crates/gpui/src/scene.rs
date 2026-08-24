@@ -630,9 +630,9 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
-    /// Backdrop-blur regions — deliberately OUTSIDE the primitive batch
-    /// stream: the renderer breaks its render pass at each blur's order to
-    /// snapshot the framebuffer (macOS Metal; other renderers ignore them).
+    /// Backdrop-filter regions — deliberately OUTSIDE the primitive batch
+    /// stream: the renderer breaks its render pass at each filter's order to
+    /// snapshot the framebuffer before applying blur and saturation.
     pub backdrop_blurs: Vec<BackdropBlur>,
     /// Atomic subtree groups whose children must be flattened before the
     /// linear alpha mask is applied once to the group result.
@@ -1670,19 +1670,32 @@ impl From<Underline> for Primitive {
     }
 }
 
-/// A within-window backdrop blur region: the renderer snapshots everything
-/// painted below this order and paints it back gaussian-blurred inside the
-/// rounded bounds (frosted-glass popovers). macOS Metal only — see
-/// [`crate::Window::paint_backdrop_blur`].
+/// A within-window backdrop filter region: the renderer snapshots everything
+/// painted below this order and paints it back gaussian-blurred and saturated
+/// inside the rounded bounds (frosted-glass popovers).
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct BackdropBlur {
     pub order: DrawOrder,
     pub blur_radius: ScaledPixels,
+    /// CSS `saturate()` multiplier. `1.0` leaves saturation unchanged.
+    pub saturation: f32,
+    pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+}
+
+#[cfg(test)]
+mod backdrop_filter_tests {
+    use super::*;
+
+    #[test]
+    fn backdrop_filter_gpu_abi_is_locked() {
+        assert_eq!(std::mem::size_of::<BackdropBlur>(), 64);
+        assert_eq!(std::mem::align_of::<BackdropBlur>(), 4);
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -2458,6 +2471,8 @@ mod linear_gradient_mask_tests {
         scene.insert_backdrop_blur(BackdropBlur {
             order: 0,
             blur_radius: ScaledPixels(4.0),
+            saturation: 1.0,
+            pad: 0,
             bounds: scaled_locked_mask().bounds,
             content_mask: ContentMask {
                 bounds: scaled_locked_mask().bounds,

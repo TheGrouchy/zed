@@ -37,6 +37,8 @@ mod shader_compilation {
             "linear_gradient_mask_group",
             "text_shadow_blur",
             "text_shadow_composite",
+            "backdrop_horizontal",
+            "backdrop_composite",
             "underline",
             "monochrome_sprite",
             "subpixel_sprite",

@@ -83,6 +83,13 @@ struct DirectXResources {
     text_shadow_blur_texture: ID3D11Texture2D,
     text_shadow_blur_srv: Option<ID3D11ShaderResourceView>,
     text_shadow_blur_view: Option<ID3D11RenderTargetView>,
+    // Dedicated backdrop-filter targets. Keeping these separate from mask and
+    // text-shadow scratch surfaces makes nested offscreen work deterministic.
+    backdrop_snapshot_texture: ID3D11Texture2D,
+    backdrop_snapshot_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_horizontal_texture: ID3D11Texture2D,
+    backdrop_horizontal_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_horizontal_view: Option<ID3D11RenderTargetView>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -96,6 +103,8 @@ struct DirectXRenderPipelines {
     linear_mask_group_pipeline: PipelineState<LinearGradientMaskParams>,
     text_shadow_blur_pipeline: PipelineState<ScaledTextShadow>,
     text_shadow_composite_pipeline: PipelineState<ScaledTextShadow>,
+    backdrop_horizontal_pipeline: PipelineState<BackdropBlur>,
+    backdrop_composite_pipeline: PipelineState<BackdropBlur>,
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
@@ -105,6 +114,7 @@ struct DirectXRenderPipelines {
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    clamp_sampler: Option<ID3D11SamplerState>,
     pixelated_sampler: Option<ID3D11SamplerState>,
 }
 
@@ -367,7 +377,14 @@ impl DirectXRenderer {
         target_view: &Option<ID3D11RenderTargetView>,
         annotation: Option<&ID3DUserDefinedAnnotation>,
     ) -> Result<()> {
+        let mut pending_backdrop_filters = scene.backdrop_blurs.iter().peekable();
         for batch in scene.batches() {
+            while pending_backdrop_filters
+                .peek()
+                .is_some_and(|filter| filter.order <= batch_first_order(scene, &batch))
+            {
+                self.draw_backdrop_filter(pending_backdrop_filters.next().unwrap(), target_view)?;
+            }
             let _annotation = annotation
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
@@ -429,6 +446,9 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             })?;
+        }
+        for filter in pending_backdrop_filters {
+            self.draw_backdrop_filter(filter, target_view)?;
         }
         Ok(())
     }
@@ -837,6 +857,101 @@ impl DirectXRenderer {
         self.draw_scene_batches(&group.scene, parent_target, annotation)
     }
 
+    /// Snapshot the already-painted framebuffer, run a separable gaussian,
+    /// then composite the filtered pixels back through the source rounded
+    /// bounds. Scene validation keeps backdrop sampling out of nested scratch
+    /// groups, so the source is always the current swap-chain target.
+    fn draw_backdrop_filter(
+        &mut self,
+        filter: &BackdropBlur,
+        parent_target: &Option<ID3D11RenderTargetView>,
+    ) -> Result<()> {
+        let (
+            render_target,
+            snapshot_texture,
+            snapshot_srv,
+            horizontal_view,
+            horizontal_srv,
+            viewport,
+        ) = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            (
+                resources
+                    .render_target
+                    .clone()
+                    .context("missing render target texture")?,
+                resources.backdrop_snapshot_texture.clone(),
+                resources.backdrop_snapshot_srv.clone(),
+                resources.backdrop_horizontal_view.clone(),
+                resources.backdrop_horizontal_srv.clone(),
+                resources.viewport,
+            )
+        };
+        let (device, device_context) = {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            (devices.device.clone(), devices.device_context.clone())
+        };
+
+        self.pipelines.backdrop_horizontal_pipeline.update_buffer(
+            &device,
+            &device_context,
+            slice::from_ref(filter),
+        )?;
+        self.pipelines.backdrop_composite_pipeline.update_buffer(
+            &device,
+            &device_context,
+            slice::from_ref(filter),
+        )?;
+
+        unsafe {
+            // D3D11 forbids a resource from being bound for both read and
+            // write. Explicitly release every t0 binding and render target
+            // before copying the current framebuffer into the snapshot.
+            device_context.PSSetShaderResources(0, Some(&[None]));
+            device_context.VSSetShaderResources(0, Some(&[None]));
+            device_context.PSSetShaderResources(2, Some(&[None]));
+            device_context.VSSetShaderResources(2, Some(&[None]));
+            device_context.OMSetRenderTargets(None, None);
+            device_context.CopyResource(&snapshot_texture, &render_target);
+
+            device_context.ClearRenderTargetView(
+                horizontal_view
+                    .as_ref()
+                    .context("missing backdrop horizontal view")?,
+                &[0.0; 4],
+            );
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&horizontal_view)), None);
+        }
+
+        self.pipelines
+            .backdrop_horizontal_pipeline
+            .draw_with_texture(
+                &device_context,
+                slice::from_ref(&snapshot_srv),
+                slice::from_ref(&viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.clamp_sampler),
+                1,
+            )?;
+
+        unsafe {
+            device_context.PSSetShaderResources(0, Some(&[None]));
+            device_context.VSSetShaderResources(0, Some(&[None]));
+            device_context.OMSetRenderTargets(Some(slice::from_ref(parent_target)), None);
+        }
+        self.pipelines
+            .backdrop_composite_pipeline
+            .draw_with_two_textures(
+                &device_context,
+                slice::from_ref(&horizontal_srv),
+                slice::from_ref(&snapshot_srv),
+                slice::from_ref(&viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.clamp_sampler),
+                1,
+            )
+    }
+
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
         if len == 0 {
             return Ok(());
@@ -1021,6 +1136,10 @@ impl DirectXResources {
             create_linear_mask_group_texture(&devices.device, width, height)?;
         let (text_shadow_blur_texture, text_shadow_blur_srv, text_shadow_blur_view) =
             create_linear_mask_group_texture(&devices.device, width, height)?;
+        let (backdrop_snapshot_texture, backdrop_snapshot_srv) =
+            create_path_intermediate_texture(&devices.device, width, height)?;
+        let (backdrop_horizontal_texture, backdrop_horizontal_srv, backdrop_horizontal_view) =
+            create_linear_mask_group_texture(&devices.device, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
@@ -1037,6 +1156,11 @@ impl DirectXResources {
             text_shadow_blur_texture,
             text_shadow_blur_srv,
             text_shadow_blur_view,
+            backdrop_snapshot_texture,
+            backdrop_snapshot_srv,
+            backdrop_horizontal_texture,
+            backdrop_horizontal_srv,
+            backdrop_horizontal_view,
             viewport,
         })
     }
@@ -1061,6 +1185,10 @@ impl DirectXResources {
             create_linear_mask_group_texture(&devices.device, width, height)?;
         let (text_shadow_blur_texture, text_shadow_blur_srv, text_shadow_blur_view) =
             create_linear_mask_group_texture(&devices.device, width, height)?;
+        let (backdrop_snapshot_texture, backdrop_snapshot_srv) =
+            create_path_intermediate_texture(&devices.device, width, height)?;
+        let (backdrop_horizontal_texture, backdrop_horizontal_srv, backdrop_horizontal_view) =
+            create_linear_mask_group_texture(&devices.device, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.path_intermediate_texture = path_intermediate_texture;
@@ -1073,6 +1201,11 @@ impl DirectXResources {
         self.text_shadow_blur_texture = text_shadow_blur_texture;
         self.text_shadow_blur_srv = text_shadow_blur_srv;
         self.text_shadow_blur_view = text_shadow_blur_view;
+        self.backdrop_snapshot_texture = backdrop_snapshot_texture;
+        self.backdrop_snapshot_srv = backdrop_snapshot_srv;
+        self.backdrop_horizontal_texture = backdrop_horizontal_texture;
+        self.backdrop_horizontal_srv = backdrop_horizontal_srv;
+        self.backdrop_horizontal_view = backdrop_horizontal_view;
         self.viewport = viewport;
         Ok(())
     }
@@ -1129,6 +1262,20 @@ impl DirectXRenderPipelines {
             1,
             create_blend_state(device)?,
         )?;
+        let backdrop_horizontal_pipeline = PipelineState::new(
+            device,
+            "backdrop_horizontal_pipeline",
+            ShaderModule::BackdropHorizontal,
+            1,
+            create_blend_state_disabled(device)?,
+        )?;
+        let backdrop_composite_pipeline = PipelineState::new(
+            device,
+            "backdrop_composite_pipeline",
+            ShaderModule::BackdropComposite,
+            1,
+            create_blend_state_disabled(device)?,
+        )?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
@@ -1166,6 +1313,8 @@ impl DirectXRenderPipelines {
             linear_mask_group_pipeline,
             text_shadow_blur_pipeline,
             text_shadow_composite_pipeline,
+            backdrop_horizontal_pipeline,
+            backdrop_composite_pipeline,
             underline_pipeline,
             mono_sprites,
             subpixel_sprites,
@@ -1230,6 +1379,24 @@ impl DirectXGlobalElements {
             output
         };
 
+        let clamp_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         let pixelated_sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
@@ -1251,6 +1418,7 @@ impl DirectXGlobalElements {
         Ok(Self {
             global_params_buffer,
             sampler,
+            clamp_sampler,
             pixelated_sampler,
         })
     }
@@ -1386,6 +1554,37 @@ impl<T> PipelineState<T> {
         Ok(())
     }
 
+    fn draw_with_two_textures(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        texture0: &[Option<ID3D11ShaderResourceView>],
+        texture2: &[Option<ID3D11ShaderResourceView>],
+        viewport: &[D3D11_VIEWPORT],
+        global_params: &[Option<ID3D11Buffer>],
+        sampler: &[Option<ID3D11SamplerState>],
+        instance_count: u32,
+    ) -> Result<()> {
+        set_pipeline_state(
+            device_context,
+            slice::from_ref(&self.view),
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            viewport,
+            &self.vertex,
+            &self.fragment,
+            global_params,
+            &self.blend_state,
+        );
+        unsafe {
+            device_context.PSSetSamplers(0, Some(sampler));
+            device_context.VSSetShaderResources(0, Some(texture0));
+            device_context.PSSetShaderResources(0, Some(texture0));
+            device_context.VSSetShaderResources(2, Some(texture2));
+            device_context.PSSetShaderResources(2, Some(texture2));
+            device_context.DrawInstanced(4, instance_count, 0, 0);
+        }
+        Ok(())
+    }
+
     fn draw_range(
         &self,
         device: &ID3D11Device,
@@ -1458,6 +1657,29 @@ struct PathRasterizationSprite {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+}
+
+/// Draw order of the first primitive represented by a batch. Backdrop filters
+/// use this boundary to snapshot precisely between lower and higher content.
+fn batch_first_order(scene: &Scene, batch: &PrimitiveBatch) -> DrawOrder {
+    match batch {
+        PrimitiveBatch::Shadows(range) => scene.shadows[range.start].order,
+        PrimitiveBatch::Quads(range) => scene.quads[range.start].order,
+        PrimitiveBatch::Paths(range) => scene.paths[range.start].order,
+        PrimitiveBatch::Underlines(range) => scene.underlines[range.start].order,
+        PrimitiveBatch::MonochromeSprites { range, .. } => {
+            scene.monochrome_sprites[range.start].order
+        }
+        PrimitiveBatch::SubpixelSprites { range, .. } => scene.subpixel_sprites[range.start].order,
+        PrimitiveBatch::PolychromeSprites { range, .. } => {
+            scene.polychrome_sprites[range.start].order
+        }
+        PrimitiveBatch::Surfaces(range) => scene.surfaces[range.start].order,
+        PrimitiveBatch::TextShadowGroup(index) => scene.text_shadow_groups[*index].order,
+        PrimitiveBatch::LinearGradientMaskGroup(index) => {
+            scene.linear_gradient_mask_groups[*index].order
+        }
+    }
 }
 
 impl Drop for DirectXRenderer {
@@ -1931,6 +2153,8 @@ pub(crate) mod shader_resources {
         LinearGradientMaskGroup,
         TextShadowBlur,
         TextShadowComposite,
+        BackdropHorizontal,
+        BackdropComposite,
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
@@ -2007,6 +2231,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::TextShadowComposite => match target {
                     ShaderTarget::Vertex => TEXT_SHADOW_COMPOSITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => TEXT_SHADOW_COMPOSITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropHorizontal => match target {
+                    ShaderTarget::Vertex => BACKDROP_HORIZONTAL_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_HORIZONTAL_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropComposite => match target {
+                    ShaderTarget::Vertex => BACKDROP_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_COMPOSITE_FRAGMENT_BYTES,
                 },
                 ShaderModule::MonochromeSprite => match target {
                     ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
@@ -2110,6 +2342,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::LinearGradientMaskGroup => "linear_gradient_mask_group",
                 ShaderModule::TextShadowBlur => "text_shadow_blur",
                 ShaderModule::TextShadowComposite => "text_shadow_composite",
+                ShaderModule::BackdropHorizontal => "backdrop_horizontal",
+                ShaderModule::BackdropComposite => "backdrop_composite",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
@@ -2152,6 +2386,32 @@ pub(crate) mod shader_resources {
                 build_shader_blob(module, ShaderTarget::Fragment)
                     .expect("text-shadow fragment shader must compile");
             }
+        }
+
+        #[test]
+        fn backdrop_filter_shaders_compile_with_fxc() {
+            for module in [
+                ShaderModule::BackdropHorizontal,
+                ShaderModule::BackdropComposite,
+            ] {
+                build_shader_blob(module, ShaderTarget::Vertex)
+                    .expect("backdrop-filter vertex shader must compile");
+                build_shader_blob(module, ShaderTarget::Fragment)
+                    .expect("backdrop-filter fragment shader must compile");
+            }
+        }
+
+        #[test]
+        fn backdrop_filter_keeps_the_locked_css_and_destination_contract() {
+            let shader = include_str!("shaders.hlsl");
+            let renderer = include_str!("directx_renderer.rs");
+            assert!(shader.contains("0.213 + 0.787 * amount"));
+            assert!(shader.contains("0.715 + 0.285 * amount"));
+            assert!(shader.contains("0.072 + 0.928 * amount"));
+            assert!(shader.contains("t_backdrop_original.SampleLevel"));
+            assert!(renderer.contains("CopyResource(&snapshot_texture, &render_target)"));
+            assert!(renderer.contains("D3D11_TEXTURE_ADDRESS_CLAMP"));
+            assert!(renderer.contains("batch_first_order(scene, &batch)"));
         }
 
         #[test]

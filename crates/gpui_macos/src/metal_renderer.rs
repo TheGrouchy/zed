@@ -2840,6 +2840,8 @@ mod backdrop_blur_tests {
         scene.insert_backdrop_blur(BackdropBlur {
             order: 0,
             blur_radius: ScaledPixels(radius),
+            saturation: 1.0,
+            pad: 0,
             bounds: blur_bounds,
             content_mask: ContentMask { bounds: viewport() },
             corner_radii: Corners::default(),

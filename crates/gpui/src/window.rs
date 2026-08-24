@@ -4102,19 +4102,36 @@ impl Window {
         }
     }
 
-    /// Paint a within-window backdrop blur: everything already painted
-    /// beneath `bounds` is snapshotted and painted back gaussian-blurred
-    /// inside the rounded rect (frosted-glass popovers). macOS Metal only —
-    /// other renderers ignore it, so callers keep a translucent fill over it
-    /// and the fallback is merely unblurred. Content painted AFTER this call
-    /// composites on top of the blur.
+    /// Paint a within-window backdrop blur. This is the compatibility form of
+    /// [`Self::paint_backdrop_filter`] with unchanged saturation.
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         blur_radius: Pixels,
     ) {
+        self.paint_backdrop_filter(bounds, corner_radii, blur_radius, 1.0);
+    }
+
+    /// Paint a CSS-compatible within-window backdrop blur and saturation
+    /// filter. Content painted after this call composites above the filtered
+    /// snapshot.
+    pub fn paint_backdrop_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        saturation: f32,
+    ) {
         self.invalidator.debug_assert_paint();
+        assert!(
+            blur_radius.0.is_finite() && blur_radius.0 >= 0.0,
+            "backdrop blur radius must be finite and non-negative"
+        );
+        assert!(
+            saturation.is_finite() && saturation >= 0.0,
+            "backdrop saturation must be finite and non-negative"
+        );
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask().scale(scale_factor);
         // Invisible splitter primitive: forces a batch boundary at this order
@@ -4134,6 +4151,8 @@ impl Window {
         self.next_frame.scene.insert_backdrop_blur(BackdropBlur {
             order: 0,
             blur_radius: blur_radius.scale(scale_factor),
+            saturation,
+            pad: 0,
             bounds: bounds.scale(scale_factor),
             content_mask,
             corner_radii: corner_radii.scale(scale_factor),

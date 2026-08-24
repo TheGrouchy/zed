@@ -10,6 +10,7 @@ cbuffer GlobalParams: register(b0) {
 };
 
 Texture2D<float4> t_sprite: register(t0);
+Texture2D<float4> t_backdrop_original: register(t2);
 SamplerState s_sprite: register(s0);
 
 struct SubpixelSpriteFragmentOutput {
@@ -822,6 +823,149 @@ float4 text_shadow_composite_fragment(TextShadowCompositeVertexOutput input): SV
     float4 color = hsla_to_rgba(shadow.color);
     color.a *= alpha;
     return color;
+}
+
+/*
+**
+**              Backdrop filter (blur + saturation)
+**
+*/
+
+struct BackdropBlur {
+    uint order;
+    float blur_radius;
+    float saturation;
+    uint pad;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+};
+
+StructuredBuffer<BackdropBlur> backdrop_horizontal_filters: register(t1);
+
+Bounds backdrop_visible_bounds(BackdropBlur filter) {
+    float2 minimum = max(filter.bounds.origin, filter.content_mask.origin);
+    float2 maximum = min(
+        filter.bounds.origin + filter.bounds.size,
+        filter.content_mask.origin + filter.content_mask.size
+    );
+    minimum = clamp(minimum, float2(0.0, 0.0), global_viewport_size);
+    maximum = clamp(maximum, float2(0.0, 0.0), global_viewport_size);
+    Bounds visible;
+    visible.origin = minimum;
+    visible.size = max(maximum - minimum, float2(0.0, 0.0));
+    return visible;
+}
+
+struct BackdropFilterVertexOutput {
+    nointerpolation uint filter_id: TEXCOORD0;
+    float4 position: SV_Position;
+};
+
+BackdropFilterVertexOutput backdrop_horizontal_vertex(
+    uint vertex_id: SV_VertexID,
+    uint filter_id: SV_InstanceID
+) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlur filter = backdrop_horizontal_filters[filter_id];
+    Bounds pass_bounds = backdrop_visible_bounds(filter);
+    float padding = ceil(3.0 * max(filter.blur_radius, 0.0)) + 2.0;
+    float y0 = max(0.0, pass_bounds.origin.y - padding);
+    float y1 = min(global_viewport_size.y,
+                   pass_bounds.origin.y + pass_bounds.size.y + padding);
+    pass_bounds.origin.y = y0;
+    pass_bounds.size.y = max(0.0, y1 - y0);
+
+    BackdropFilterVertexOutput output;
+    output.filter_id = filter_id;
+    output.position = to_device_position(unit_vertex, pass_bounds);
+    return output;
+}
+
+float4 backdrop_horizontal_fragment(BackdropFilterVertexOutput input): SV_Target {
+    BackdropBlur filter = backdrop_horizontal_filters[input.filter_id];
+    float sigma = filter.blur_radius;
+    float2 uv = input.position.xy / global_viewport_size;
+    if (sigma <= 0.0001) {
+        return t_sprite.SampleLevel(s_sprite, uv, 0.0);
+    }
+
+    int radius = int(ceil(3.0 * sigma));
+    float4 sum = t_sprite.SampleLevel(s_sprite, uv, 0.0);
+    float weight_sum = 1.0;
+    [loop]
+    for (int distance = 1; distance <= radius; ++distance) {
+        float x = float(distance);
+        float weight = exp(-0.5 * x * x / (sigma * sigma));
+        float2 delta = float2(x / global_viewport_size.x, 0.0);
+        sum += t_sprite.SampleLevel(s_sprite, uv - delta, 0.0) * weight;
+        sum += t_sprite.SampleLevel(s_sprite, uv + delta, 0.0) * weight;
+        weight_sum += 2.0 * weight;
+    }
+    return sum / weight_sum;
+}
+
+StructuredBuffer<BackdropBlur> backdrop_composite_filters: register(t1);
+
+BackdropFilterVertexOutput backdrop_composite_vertex(
+    uint vertex_id: SV_VertexID,
+    uint filter_id: SV_InstanceID
+) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropFilterVertexOutput output;
+    output.filter_id = filter_id;
+    output.position = to_device_position(
+        unit_vertex,
+        backdrop_visible_bounds(backdrop_composite_filters[filter_id])
+    );
+    return output;
+}
+
+float3 css_saturate(float3 color, float amount) {
+    return float3(
+        dot(color, float3(0.213 + 0.787 * amount,
+                          0.715 - 0.715 * amount,
+                          0.072 - 0.072 * amount)),
+        dot(color, float3(0.213 - 0.213 * amount,
+                          0.715 + 0.285 * amount,
+                          0.072 - 0.072 * amount)),
+        dot(color, float3(0.213 - 0.213 * amount,
+                          0.715 - 0.715 * amount,
+                          0.072 + 0.928 * amount))
+    );
+}
+
+float4 backdrop_composite_fragment(BackdropFilterVertexOutput input): SV_Target {
+    BackdropBlur filter = backdrop_composite_filters[input.filter_id];
+    float sigma = filter.blur_radius;
+    float2 uv = input.position.xy / global_viewport_size;
+    float4 filtered;
+    if (sigma <= 0.0001) {
+        filtered = t_sprite.SampleLevel(s_sprite, uv, 0.0);
+    } else {
+        int radius = int(ceil(3.0 * sigma));
+        filtered = t_sprite.SampleLevel(s_sprite, uv, 0.0);
+        float weight_sum = 1.0;
+        [loop]
+        for (int distance = 1; distance <= radius; ++distance) {
+            float y = float(distance);
+            float weight = exp(-0.5 * y * y / (sigma * sigma));
+            float2 delta = float2(0.0, y / global_viewport_size.y);
+            filtered += t_sprite.SampleLevel(s_sprite, uv - delta, 0.0) * weight;
+            filtered += t_sprite.SampleLevel(s_sprite, uv + delta, 0.0) * weight;
+            weight_sum += 2.0 * weight;
+        }
+        filtered /= weight_sum;
+    }
+    filtered.rgb = saturate(css_saturate(filtered.rgb, filter.saturation));
+
+    // The final pass has blending disabled. Mix the exact destination
+    // snapshot here so rounded antialiasing neither clears nor darkens the
+    // pixels just outside the filter's border box.
+    float4 original = t_backdrop_original.SampleLevel(s_sprite, uv, 0.0);
+    float distance = quad_sdf(input.position.xy, filter.bounds, filter.corner_radii);
+    float coverage = saturate(0.5 - distance);
+    return lerp(original, filtered, coverage);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
