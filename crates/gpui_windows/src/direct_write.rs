@@ -639,6 +639,59 @@ impl DirectWriteState {
             .as_ref()?
             .fallback_list()
             .to_vec();
+        let codepoint = character as u32;
+        let uses_system_ui = fallback_names.iter().any(|name| name == "system-ui");
+        let chromium_script_fallback = if matches!(
+            codepoint,
+            0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff | 0xfb50..=0xfdff | 0xfe70..=0xfeff
+        ) {
+            Some((
+                if uses_system_ui { "Segoe UI" } else { "Arial" },
+                request.weight,
+            ))
+        } else if matches!(codepoint, 0x0590..=0x05ff | 0xfb1d..=0xfb4f) {
+            Some((
+                if uses_system_ui {
+                    "Segoe UI"
+                } else {
+                    "Times New Roman"
+                },
+                request.weight,
+            ))
+        } else if matches!(codepoint, 0x0900..=0x097f) {
+            Some(("Nirmala UI", request.weight))
+        } else if matches!(codepoint, 0x0e00..=0x0e7f) {
+            Some(("Tahoma", request.weight))
+        } else if matches!(
+            codepoint,
+            0x1100..=0x11ff
+                | 0x3040..=0x30ff
+                | 0x3130..=0x318f
+                | 0x3400..=0x4dbf
+                | 0x4e00..=0x9fff
+                | 0xac00..=0xd7af
+                | 0xf900..=0xfaff
+        ) {
+            // Chromium keeps CJK fallback advances on the regular physical
+            // face even when the surrounding CSS request is heavy.
+            Some(("Arial", 400))
+        } else if matches!(codepoint, 0x1f000..=0x1faff | 0x2600..=0x27bf) {
+            // Color emoji has no CSS weight variants in Chromium.
+            Some(("Segoe UI Emoji", 400))
+        } else {
+            None
+        };
+        if let Some((family, physical_weight)) = chromium_script_fallback {
+            let mut physical_font = request.source_font.clone();
+            physical_font.family = family.to_string().into();
+            physical_font.weight = FontWeight(physical_weight as f32);
+            physical_font.fallbacks = None;
+            return self
+                .font_to_font_id
+                .get(&physical_font)
+                .copied()
+                .or_else(|| self.select_and_cache_font(components, &physical_font));
+        }
         for fallback in fallback_names {
             let mut physical_font = request.source_font.clone();
             physical_font.family =
