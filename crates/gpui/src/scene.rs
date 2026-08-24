@@ -3146,6 +3146,21 @@ mod image_sampling_tests {
     }
 
     #[test]
+    fn every_renderer_lowers_elliptical_radial_gradients_from_locked_geometry() {
+        for shader in [
+            include_str!("../../gpui_windows/src/shaders.hlsl"),
+            include_str!("../../gpui_wgpu/src/shaders.wgsl"),
+            include_str!("../../gpui_macos/src/shaders.metal"),
+        ] {
+            assert!(shader.contains("radial_geometry.center_x"));
+            assert!(shader.contains("radial_geometry.center_y"));
+            assert!(shader.contains("radial_geometry.radius_x"));
+            assert!(shader.contains("radial_geometry.radius_y"));
+            assert!(shader.contains("length((position - center) / radii)"));
+        }
+    }
+
+    #[test]
     fn locked_avatar_point_sampling_matches_every_chromium_pixel() {
         let metadata: Value = serde_json::from_str(include_str!(
             "../tests/fixtures/image_sampling_pixelated_chromium.json"

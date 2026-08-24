@@ -48,15 +48,25 @@ struct LinearColorStop {
     float percentage;
 };
 
+struct RadialGradientGeometry {
+    float center_x;
+    float center_y;
+    float radius_x;
+    float radius_y;
+};
+
 struct Background {
     // 0u is Solid
     // 1u is LinearGradient
     // 2u is PatternSlash
+    // 3u is Checkerboard
+    // 4u is RadialGradient
     uint tag;
     // 0u is sRGB linear color
     // 1u is Oklab color
     uint color_space;
     Hsla solid;
+    RadialGradientGeometry radial_geometry;
     float gradient_angle_or_pattern_height;
     LinearColorStop colors[5];
     uint stop_count;
@@ -417,6 +427,57 @@ float4 gradient_color(Background background,
                 color.a   += tri * 3.0 / 255.0;
             }
 
+            break;
+        }
+        case 4: {
+            float2 center = bounds.origin + float2(
+                background.radial_geometry.center_x * bounds.size.x,
+                background.radial_geometry.center_y * bounds.size.y);
+            float2 radii = max(float2(
+                background.radial_geometry.radius_x * bounds.size.x,
+                background.radial_geometry.radius_y * bounds.size.y),
+                float2(0.000001, 0.000001));
+            float t = length((position - center) / radii);
+
+            uint stop_count = clamp(background.stop_count, 2u, 5u);
+            uint stop_index = 0u;
+            [unroll]
+            for (uint i = 1u; i < 5u; i++) {
+                if (i < stop_count && t >= background.colors[i].percentage) {
+                    stop_index = i;
+                }
+            }
+            stop_index = min(stop_index, stop_count - 2u);
+
+            float start = background.colors[stop_index].percentage;
+            float end = background.colors[stop_index + 1u].percentage;
+            float interval_t = end > start
+                ? clamp((t - start) / (end - start), 0.0, 1.0)
+                : (t < end ? 0.0 : 1.0);
+            float4 interval_color0 = hsla_to_rgba(background.colors[stop_index].color);
+            float4 interval_color1 = hsla_to_rgba(background.colors[stop_index + 1u].color);
+
+            switch (background.color_space) {
+                case 0:
+                    color = lerp(interval_color0, interval_color1, interval_t);
+                    break;
+                case 1: {
+                    interval_color0 = srgb_to_oklab(interval_color0);
+                    interval_color1 = srgb_to_oklab(interval_color1);
+                    float4 oklab_color = lerp(interval_color0, interval_color1, interval_t);
+                    color = oklab_to_srgb(oklab_color);
+                    break;
+                }
+            }
+
+            {
+                float2 seed = position * 0.6180339887;
+                float r1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+                float r2 = frac(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
+                float tri = r1 + r2 - 1.0;
+                color.rgb += tri * 2.0 / 255.0;
+                color.a   += tri * 3.0 / 255.0;
+            }
             break;
         }
         case 2: {

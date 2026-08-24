@@ -130,16 +130,25 @@ struct LinearColorStop {
     percentage: f32,
 }
 
+struct RadialGradientGeometry {
+    center_x: f32,
+    center_y: f32,
+    radius_x: f32,
+    radius_y: f32,
+}
+
 struct Background {
     // 0u is Solid
     // 1u is LinearGradient
     // 2u is PatternSlash
     // 3u is Checkerboard
+    // 4u is RadialGradient
     tag: u32,
     // 0u is sRGB linear color
     // 1u is Oklab color
     color_space: u32,
     solid: Hsla,
+    radial_geometry: RadialGradientGeometry,
     gradient_angle_or_pattern_height: f32,
     colors: array<LinearColorStop, 5>,
     stop_count: u32,
@@ -463,6 +472,58 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
             // Select the source-defined interval. Advancing on equality is
             // required for CSS hard stops with duplicate offsets.
+            let stop_count = clamp(background.stop_count, 2u, 5u);
+            var stop_index = 0u;
+            for (var i = 1u; i < 5u; i += 1u) {
+                if (i < stop_count && t >= background.colors[i].percentage) {
+                    stop_index = i;
+                }
+            }
+            stop_index = min(stop_index, stop_count - 2u);
+
+            let start = background.colors[stop_index].percentage;
+            let end = background.colors[stop_index + 1u].percentage;
+            var interval_t = 1.0;
+            if (end > start) {
+                interval_t = clamp((t - start) / (end - start), 0.0, 1.0);
+            } else if (t < end) {
+                interval_t = 0.0;
+            }
+            var interval_color0 = hsla_to_rgba(background.colors[stop_index].color);
+            var interval_color1 = hsla_to_rgba(background.colors[stop_index + 1u].color);
+
+            switch (background.color_space) {
+                default: {
+                    interval_color0 = linear_to_srgba(interval_color0);
+                    interval_color1 = linear_to_srgba(interval_color1);
+                    background_color = srgba_to_linear(mix(
+                        interval_color0,
+                        interval_color1,
+                        interval_t,
+                    ));
+                }
+                case 1u: {
+                    interval_color0 = linear_srgb_to_oklab(interval_color0);
+                    interval_color1 = linear_srgb_to_oklab(interval_color1);
+                    let oklab_color = mix(interval_color0, interval_color1, interval_t);
+                    background_color = oklab_to_linear_srgb(oklab_color);
+                }
+            }
+        }
+        case 4u: {
+            let center = bounds.origin + vec2<f32>(
+                background.radial_geometry.center_x * bounds.size.x,
+                background.radial_geometry.center_y * bounds.size.y,
+            );
+            let radii = max(
+                vec2<f32>(
+                    background.radial_geometry.radius_x * bounds.size.x,
+                    background.radial_geometry.radius_y * bounds.size.y,
+                ),
+                vec2<f32>(0.000001),
+            );
+            let t = length((position - center) / radii);
+
             let stop_count = clamp(background.stop_count, 2u, 5u);
             var stop_index = 0u;
             for (var i = 1u; i < 5u; i += 1u) {

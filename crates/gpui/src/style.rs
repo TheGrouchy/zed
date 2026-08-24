@@ -783,6 +783,11 @@ impl Style {
                         .first()
                         .map(|stop| stop.color)
                         .unwrap_or_default(),
+                    BackgroundTag::RadialGradient => color
+                        .colors
+                        .first()
+                        .map(|stop| stop.color)
+                        .unwrap_or_default(),
                 },
                 None => Hsla::default(),
             };

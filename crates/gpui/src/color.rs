@@ -747,6 +747,16 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    RadialGradient = 4,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[repr(C)]
+pub(crate) struct RadialGradientGeometry {
+    center_x: f32,
+    center_y: f32,
+    radius_x: f32,
+    radius_y: f32,
 }
 
 /// A color space for color interpolation.
@@ -773,13 +783,16 @@ impl Display for ColorSpace {
     }
 }
 
-/// A background color, which can be either a solid color or a linear gradient.
+/// A native background paint.
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
 pub struct Background {
     pub(crate) tag: BackgroundTag,
     pub(crate) color_space: ColorSpace,
     pub(crate) solid: Hsla,
+    /// Elliptical radial-gradient center X/Y and radius X/Y, all expressed as
+    /// ratios of the painted bounds. Centers may sit outside the bounds.
+    pub(crate) radial_geometry: RadialGradientGeometry,
     pub(crate) gradient_angle_or_pattern_height: f32,
     pub(crate) colors: [LinearColorStop; MAX_LINEAR_GRADIENT_STOPS],
     pub(crate) stop_count: u32,
@@ -805,6 +818,12 @@ impl std::fmt::Debug for Background {
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
             ),
+            BackgroundTag::RadialGradient => write!(
+                f,
+                "RadialGradient({:?}, {:?})",
+                self.radial_geometry,
+                &self.colors[..(self.stop_count as usize).min(MAX_LINEAR_GRADIENT_STOPS)]
+            ),
         }
     }
 }
@@ -816,6 +835,7 @@ impl Default for Background {
             tag: BackgroundTag::Solid,
             solid: Hsla::default(),
             color_space: ColorSpace::default(),
+            radial_geometry: RadialGradientGeometry::default(),
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(); MAX_LINEAR_GRADIENT_STOPS],
             stop_count: 0,
@@ -881,15 +901,7 @@ pub const MAX_LINEAR_GRADIENT_STOPS: usize = 5;
 /// [`MAX_LINEAR_GRADIENT_STOPS`]. Callers can therefore remain fail-closed
 /// instead of silently dropping or approximating stops.
 pub fn try_linear_gradient_stops(angle: f32, stops: &[LinearColorStop]) -> Option<Background> {
-    if !angle.is_finite()
-        || !(2..=MAX_LINEAR_GRADIENT_STOPS).contains(&stops.len())
-        || stops
-            .iter()
-            .any(|stop| !stop.percentage.is_finite() || !(0.0..=1.0).contains(&stop.percentage))
-        || stops
-            .windows(2)
-            .any(|pair| pair[0].percentage > pair[1].percentage)
-    {
+    if !angle.is_finite() || !valid_gradient_stops(stops) {
         return None;
     }
 
@@ -902,6 +914,72 @@ pub fn try_linear_gradient_stops(angle: f32, stops: &[LinearColorStop]) -> Optio
         stop_count: stops.len() as u32,
         ..Default::default()
     })
+}
+
+/// Creates a two-stop elliptical radial gradient. Center and radius values are
+/// ratios of the painted bounds, matching explicit CSS ellipse percentages.
+/// A center outside `0..=1` is valid; both radii must be finite and positive.
+pub fn radial_gradient(
+    center_x: f32,
+    center_y: f32,
+    radius_x: f32,
+    radius_y: f32,
+    from: impl Into<LinearColorStop>,
+    to: impl Into<LinearColorStop>,
+) -> Background {
+    try_radial_gradient_stops(
+        center_x,
+        center_y,
+        radius_x,
+        radius_y,
+        &[from.into(), to.into()],
+    )
+    .expect("a finite positive two-stop radial gradient fits the native representation")
+}
+
+/// Creates an elliptical radial gradient from an ordered stop list.
+pub fn try_radial_gradient_stops(
+    center_x: f32,
+    center_y: f32,
+    radius_x: f32,
+    radius_y: f32,
+    stops: &[LinearColorStop],
+) -> Option<Background> {
+    if !center_x.is_finite()
+        || !center_y.is_finite()
+        || !radius_x.is_finite()
+        || !radius_y.is_finite()
+        || radius_x <= 0.0
+        || radius_y <= 0.0
+        || !valid_gradient_stops(stops)
+    {
+        return None;
+    }
+
+    let mut colors = [LinearColorStop::default(); MAX_LINEAR_GRADIENT_STOPS];
+    colors[..stops.len()].copy_from_slice(stops);
+    Some(Background {
+        tag: BackgroundTag::RadialGradient,
+        radial_geometry: RadialGradientGeometry {
+            center_x,
+            center_y,
+            radius_x,
+            radius_y,
+        },
+        colors,
+        stop_count: stops.len() as u32,
+        ..Default::default()
+    })
+}
+
+fn valid_gradient_stops(stops: &[LinearColorStop]) -> bool {
+    (2..=MAX_LINEAR_GRADIENT_STOPS).contains(&stops.len())
+        && !stops
+            .iter()
+            .any(|stop| !stop.percentage.is_finite() || !(0.0..=1.0).contains(&stop.percentage))
+        && !stops
+            .windows(2)
+            .any(|pair| pair[0].percentage > pair[1].percentage)
 }
 
 /// A color stop in a linear gradient.
@@ -969,6 +1047,10 @@ impl Background {
         match self.tag {
             BackgroundTag::Solid => self.solid.is_transparent(),
             BackgroundTag::LinearGradient => self.colors
+                [..(self.stop_count as usize).min(MAX_LINEAR_GRADIENT_STOPS)]
+                .iter()
+                .all(|c| c.color.is_transparent()),
+            BackgroundTag::RadialGradient => self.colors
                 [..(self.stop_count as usize).min(MAX_LINEAR_GRADIENT_STOPS)]
                 .iter()
                 .all(|c| c.color.is_transparent()),
@@ -1095,6 +1177,58 @@ mod tests {
         assert!(try_linear_gradient_stops(90.0, &too_many).is_none());
         assert!(try_linear_gradient_stops(90.0, &[stops[1], stops[0]]).is_none());
         assert!(try_linear_gradient_stops(f32::NAN, &stops).is_none());
+    }
+
+    #[test]
+    fn test_background_elliptical_radial_gradient() {
+        let from = linear_color_stop(rgba(0xffffff80), 0.0);
+        let to = linear_color_stop(rgba(0xffffff00), 0.55);
+        let background = radial_gradient(0.10, -0.12, 1.20, 0.90, from, to);
+        assert_eq!(background.tag, BackgroundTag::RadialGradient);
+        assert_eq!(
+            background.radial_geometry,
+            RadialGradientGeometry {
+                center_x: 0.10,
+                center_y: -0.12,
+                radius_x: 1.20,
+                radius_y: 0.90,
+            }
+        );
+        assert_eq!(background.stop_count, 2);
+        assert_eq!(background.colors[0], from);
+        assert_eq!(background.colors[1], to);
+        assert!(!background.is_transparent());
+        assert!(background.opacity(0.0).is_transparent());
+    }
+
+    #[test]
+    fn radial_gradient_fails_closed_for_invalid_geometry_or_stops() {
+        let stops = [
+            linear_color_stop(rgba(0xffffffff), 0.0),
+            linear_color_stop(rgba(0xffffff00), 1.0),
+        ];
+        assert!(try_radial_gradient_stops(0.5, 0.5, 1.0, 1.0, &stops).is_some());
+        assert!(try_radial_gradient_stops(f32::NAN, 0.5, 1.0, 1.0, &stops).is_none());
+        assert!(try_radial_gradient_stops(0.5, 0.5, 0.0, 1.0, &stops).is_none());
+        assert!(try_radial_gradient_stops(0.5, 0.5, 1.0, -1.0, &stops).is_none());
+        assert!(try_radial_gradient_stops(0.5, 0.5, 1.0, 1.0, &stops[..1]).is_none());
+        assert!(try_radial_gradient_stops(0.5, 0.5, 1.0, 1.0, &[stops[1], stops[0]]).is_none());
+    }
+
+    #[test]
+    fn background_shader_abi_keeps_radial_geometry_at_locked_offsets() {
+        assert_eq!(std::mem::size_of::<RadialGradientGeometry>(), 16);
+        assert_eq!(std::mem::size_of::<Background>(), 148);
+        assert_eq!(std::mem::offset_of!(Background, tag), 0);
+        assert_eq!(std::mem::offset_of!(Background, color_space), 4);
+        assert_eq!(std::mem::offset_of!(Background, solid), 8);
+        assert_eq!(std::mem::offset_of!(Background, radial_geometry), 24);
+        assert_eq!(
+            std::mem::offset_of!(Background, gradient_angle_or_pattern_height),
+            40
+        );
+        assert_eq!(std::mem::offset_of!(Background, colors), 44);
+        assert_eq!(std::mem::offset_of!(Background, stop_count), 144);
     }
 
     #[test]
