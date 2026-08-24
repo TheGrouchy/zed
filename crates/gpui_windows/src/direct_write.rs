@@ -1065,6 +1065,7 @@ impl DirectWriteState {
         factory: &IDWriteFactory5,
         custom_font_collection: &IDWriteFontCollection1,
         system_font_collection: &IDWriteFontCollection1,
+        system_ui_font_name: &SharedString,
     ) -> Result<Option<IDWriteFontFallback>> {
         let fallback_list = fallbacks.fallback_list();
         if fallback_list.is_empty() {
@@ -1074,7 +1075,22 @@ impl DirectWriteState {
             let builder = factory.CreateFontFallbackBuilder()?;
             let mut unicode_ranges = Vec::new();
             for family_name in fallback_list {
-                let family_name = HSTRING::from(family_name);
+                // CSS generic family names are not DirectWrite collection
+                // family names. Resolve the Windows equivalents before
+                // constructing an explicit fallback mapping so a web-font
+                // stack such as `system-ui, sans-serif` behaves like
+                // Chromium instead of silently falling through to the
+                // process-wide DirectWrite fallback order.
+                let resolved_family = match family_name.as_str() {
+                    "system-ui" => system_ui_font_name.as_ref(),
+                    "sans-serif" => "Arial",
+                    "ui-monospace" | "monospace" => "Consolas",
+                    "serif" => "Times New Roman",
+                    "cursive" => "Comic Sans MS",
+                    "fantasy" => "Impact",
+                    _ => family_name.as_str(),
+                };
+                let family_name = HSTRING::from(resolved_family);
                 let selected = [custom_font_collection, system_font_collection]
                     .into_iter()
                     .find_map(|font_collection| {
@@ -1242,6 +1258,7 @@ impl DirectWriteState {
                         factory,
                         custom_font_collection,
                         system_font_collection,
+                        system_ui_font_name,
                     )
                     .log_err()
                     .flatten()
@@ -2818,9 +2835,9 @@ mod tests {
     use crate::DirectXDevices;
     use crate::direct_write::{ClusterAnalyzer, DirectWriteTextSystem};
     use gpui::{
-        CssFontFace, CssFontFaceRegistry, CssUnicodeRange, EmbeddedFontResource, FontFallbacks,
-        FontRun, FontStyle, FontWeight, Pixels, PlatformTextSystem, TextRun, TextSystem,
-        WhiteSpace, WindowTextSystem, font, prepare_whitespace,
+        CssFontFace, CssFontFaceRegistry, CssUnicodeRange, EmbeddedFontResource, Font,
+        FontFallbacks, FontRun, FontStyle, FontWeight, Pixels, PlatformTextSystem, TextRun,
+        TextSystem, WhiteSpace, WindowTextSystem, font, prepare_whitespace,
     };
     use windows::core::{IUnknown, Interface};
 
@@ -3282,6 +3299,53 @@ mod tests {
             .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
             .collect::<Vec<_>>();
         assert_eq!(source_indices, vec![0, 1, 5]);
+    }
+
+    #[test]
+    fn css_generic_fallbacks_resolve_to_their_windows_families() {
+        let devices = DirectXDevices::new().unwrap();
+        let system = DirectWriteTextSystem::new(&devices).unwrap();
+        system.add_css_font_faces(css_subset_registry()).unwrap();
+
+        let mut generic = font("Waypath CSS Subset");
+        generic.fallbacks = Some(FontFallbacks::from_fonts(vec![
+            "system-ui".to_string(),
+            "sans-serif".to_string(),
+        ]));
+        let mut explicit = font("Waypath CSS Subset");
+        explicit.fallbacks = Some(FontFallbacks::from_fonts(vec![
+            system.components.system_ui_font_name.to_string(),
+            "Arial".to_string(),
+        ]));
+        let text = "A\u{0416}N";
+        let layout = |font: &Font| {
+            system.layout_line(
+                text,
+                Pixels::from(32.0),
+                &[FontRun {
+                    len: text.len(),
+                    font_id: system.font_id(font).unwrap(),
+                    letter_spacing: Pixels::ZERO,
+                }],
+            )
+        };
+        let generic_layout = layout(&generic);
+        let explicit_layout = layout(&explicit);
+        assert_eq!(generic_layout.width, explicit_layout.width);
+        assert_eq!(generic_layout.ascent, explicit_layout.ascent);
+        assert_eq!(generic_layout.descent, explicit_layout.descent);
+        assert_eq!(
+            generic_layout
+                .runs
+                .iter()
+                .map(|run| run.glyphs.len())
+                .collect::<Vec<_>>(),
+            explicit_layout
+                .runs
+                .iter()
+                .map(|run| run.glyphs.len())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
