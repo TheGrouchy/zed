@@ -492,6 +492,10 @@ impl DirectWriteState {
         best.map(|(_, _, face)| face)
     }
 
+    fn css_face_weight(face: &RegisteredCssFontFace, requested_weight: u16) -> u16 {
+        requested_weight.clamp(face.weight_start, face.weight_end)
+    }
+
     fn make_css_font_info(
         &self,
         components: &DirectWriteComponents,
@@ -509,6 +513,7 @@ impl DirectWriteState {
             .or_else(|| self.select_css_face(&font.family, font.style, weight, None))?;
         let mut physical_font = font.clone();
         physical_font.family = face.native_family_alias.clone();
+        physical_font.weight = FontWeight(Self::css_face_weight(face, weight) as f32);
         let mut info = unsafe {
             Self::make_font_from_font_collection(
                 &physical_font,
@@ -870,12 +875,13 @@ impl DirectWriteState {
         range: DWRITE_TEXT_RANGE,
     ) -> Result<()> {
         let alias = HSTRING::from(face.native_family_alias.as_ref());
+        let physical_weight = Self::css_face_weight(face, requested_weight);
         unsafe {
             layout.SetFontCollection(&self.custom_font_collection, range)?;
             layout.SetFontFamilyName(&alias, range)?;
             layout.SetFontStyle(font_style_to_dwrite(requested_style), range)?;
             layout.SetFontWeight(
-                font_weight_to_dwrite(FontWeight(requested_weight as f32)),
+                font_weight_to_dwrite(FontWeight(physical_weight as f32)),
                 range,
             )?;
             if face.supports_weight_axis {
@@ -883,7 +889,7 @@ impl DirectWriteState {
                 axis_layout.SetFontAxisValues(
                     &[DWRITE_FONT_AXIS_VALUE {
                         axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
-                        value: requested_weight as f32,
+                        value: physical_weight as f32,
                     }],
                     range,
                 )?;
@@ -1001,15 +1007,14 @@ impl DirectWriteState {
                 continue;
             };
             let run_text = &text[utf8_start..utf8_end];
-            let default_alias = self
+            let default_face = self
                 .select_css_face(&request.family, request.style, request.weight, Some(' '))
                 .or_else(|| {
                     self.select_css_face(&request.family, request.style, request.weight, None)
                 })
                 .context("registered CSS request lost its default physical face")?
-                .native_family_alias
                 .clone();
-            let aliases = run_text
+            let physical_faces = run_text
                 .chars()
                 .map(|character| {
                     self.select_css_face(
@@ -1018,15 +1023,17 @@ impl DirectWriteState {
                         request.weight,
                         Some(character),
                     )
-                    .map(|face| face.native_family_alias.clone())
-                    .unwrap_or_else(|| default_alias.clone())
+                    .cloned()
+                    .unwrap_or_else(|| default_face.clone())
                 })
                 .collect::<Vec<_>>();
 
             let mut previous_was_whitespace = None;
-            for (character, alias) in run_text.chars().zip(aliases) {
+            for (character, face) in run_text.chars().zip(physical_faces) {
                 let mut physical_font = request.source_font.clone();
-                physical_font.family = alias;
+                physical_font.family = face.native_family_alias.clone();
+                physical_font.weight =
+                    FontWeight(Self::css_face_weight(&face, request.weight) as f32);
                 let physical_id = self
                     .font_to_font_id
                     .get(&physical_font)
@@ -3465,6 +3472,29 @@ mod tests {
             31.0,
             9.0,
         );
+    }
+
+    #[test]
+    fn css_discrete_face_clamps_an_in_between_request_to_the_selected_axis() {
+        let devices = DirectXDevices::new().unwrap();
+        let system = DirectWriteTextSystem::new(&devices).unwrap();
+        system
+            .add_css_font_faces(waypath_variable_registry(
+                "Waypath Space Grotesk 700",
+                700,
+                SPACE_GROTESK_LATIN,
+                SPACE_GROTESK_LATIN_EXTENDED,
+                SPACE_GROTESK_VIETNAMESE,
+            ))
+            .unwrap();
+        let mut requested = font("Waypath Space Grotesk 700");
+        requested.weight = FontWeight(650.0);
+        let font_id = system.font_id(&requested).unwrap();
+        let state = system.state.read();
+        let info = &state.fonts[font_id.0];
+        assert_eq!(info.css_request.as_ref().unwrap().weight, 650);
+        assert_eq!(info.requested_weight.0, 700);
+        assert_eq!(info.requested_weight_axis.as_ref().unwrap().value, 700.0);
     }
 
     #[test]
