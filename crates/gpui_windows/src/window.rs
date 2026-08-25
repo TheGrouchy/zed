@@ -116,10 +116,10 @@ impl WindowsWindowState {
         disable_direct_composition: bool,
         invalidate_devices: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let scale_factor = {
+        let scale_factor = effective_windows_scale_factor({
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
             monitor_dpi / USER_DEFAULT_SCREEN_DPI as f32
-        };
+        });
         let origin = logical_point(window_params.x as f32, window_params.y as f32, scale_factor);
         let logical_size = {
             let physical_size = size(

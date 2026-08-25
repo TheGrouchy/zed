@@ -17,6 +17,43 @@ use windows::{
 use crate::*;
 use gpui::*;
 
+const WINDOWS_TEST_SCALE_FACTOR_ENV: &str = "GPUI_WINDOWS_TEST_SCALE_FACTOR";
+
+fn parse_windows_test_scale_factor(value: &str) -> Option<f32> {
+    let scale_factor = value.parse::<f32>().ok()?;
+    [1.0_f32, 1.25, 1.5]
+        .into_iter()
+        .find(|candidate| (scale_factor - candidate).abs() <= f32::EPSILON)
+}
+
+/// Returns the deterministic Windows scale used by native parity tests.
+///
+/// This intentionally accepts only the scale factors in Waypath's certification
+/// matrix. Production launches do not set this variable and continue to use the
+/// effective DPI reported by Windows.
+pub(crate) fn windows_test_scale_factor() -> Option<f32> {
+    static SCALE_FACTOR: OnceLock<Option<f32>> = OnceLock::new();
+
+    *SCALE_FACTOR.get_or_init(|| {
+        let value = std::env::var(WINDOWS_TEST_SCALE_FACTOR_ENV).ok()?;
+        let Some(scale_factor) = parse_windows_test_scale_factor(&value) else {
+            log::error!(
+                "ignoring invalid {WINDOWS_TEST_SCALE_FACTOR_ENV}={value:?}; expected 1.0, 1.25, or 1.5"
+            );
+            return None;
+        };
+        log::warn!(
+            "using {WINDOWS_TEST_SCALE_FACTOR_ENV}={scale_factor} for backend-equivalent Windows scale verification"
+        );
+        Some(scale_factor)
+    })
+}
+
+#[inline]
+pub(crate) fn effective_windows_scale_factor(native_scale_factor: f32) -> f32 {
+    windows_test_scale_factor().unwrap_or(native_scale_factor)
+}
+
 pub(crate) trait HiLoWord {
     fn hiword(&self) -> u16;
     fn loword(&self) -> u16;
@@ -188,4 +225,28 @@ where
             .log_err();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_windows_test_scale_factor;
+
+    #[test]
+    fn windows_test_scale_factor_accepts_certification_matrix() {
+        assert_eq!(parse_windows_test_scale_factor("1"), Some(1.0));
+        assert_eq!(parse_windows_test_scale_factor("1.0"), Some(1.0));
+        assert_eq!(parse_windows_test_scale_factor("1.25"), Some(1.25));
+        assert_eq!(parse_windows_test_scale_factor("1.5"), Some(1.5));
+        assert_eq!(parse_windows_test_scale_factor("1.50"), Some(1.5));
+    }
+
+    #[test]
+    fn windows_test_scale_factor_rejects_non_matrix_values() {
+        assert_eq!(parse_windows_test_scale_factor(""), None);
+        assert_eq!(parse_windows_test_scale_factor("0"), None);
+        assert_eq!(parse_windows_test_scale_factor("1.1"), None);
+        assert_eq!(parse_windows_test_scale_factor("2"), None);
+        assert_eq!(parse_windows_test_scale_factor("NaN"), None);
+        assert_eq!(parse_windows_test_scale_factor("inf"), None);
+    }
 }
